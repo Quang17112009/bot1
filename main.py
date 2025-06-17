@@ -7,6 +7,7 @@ import time
 import requests
 import threading
 import re
+from collections import deque # Để quản lý lịch sử dài hạn hiệu quả hơn
 
 # --- Cấu hình Bot và API ---
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s")
@@ -20,7 +21,10 @@ bot = telebot.TeleBot(TOKEN)
 # --- Biến toàn cục để lưu trạng thái bot ---
 last_processed_session = 0 # Phiên cuối cùng bot đã xử lý và đưa ra dự đoán
 history_data = [] # Lưu trữ dữ liệu lịch sử từ API (3 xí ngầu) - [(d1, d2, d3, session_id), ...]
-cau_history = []  # Lưu trữ lịch sử 'T' hoặc 'X' để check cầu - [('T'/'X', session_id), ...]
+cau_history = []  # Lưu trữ lịch sử 'T' hoặc 'X' để check cầu (5 phiên) - [('T'/'X', session_id), ...]
+
+# Lịch sử cầu dài hạn cho AI học hỏi (ví dụ: 50 phiên gần nhất)
+long_term_cau_history = deque(maxlen=50) # Sử dụng deque để quản lý kích thước cố định
 last_prediction_message_id = {} # Lưu ID tin nhắn dự đoán để cập nhật/xóa nếu cần
 
 # --- Hàm hỗ trợ ---
@@ -84,14 +88,12 @@ def du_doan_theo_xi_ngau(dice_list):
     if not dice_list:
         return "Đợi thêm dữ liệu"
     
-    # Lấy 3 xí ngầu cuối cùng (phần tử đầu tiên của tuple cuối cùng trong danh sách)
     d1, d2, d3 = dice_list[-1][:3]
     total = d1 + d2 + d3
 
     result_list = []
     for d in [d1, d2, d3]:
         tmp = d + total
-        # Điều chỉnh lại logic nếu tmp < 1 hoặc tmp > 6
         while tmp < 1:
             tmp += 6
         while tmp > 6:
@@ -130,6 +132,60 @@ def is_cau_dep(cau_str):
     mau_cau_dep_set = set(mau_cau_dep)
     return cau_str in mau_cau_dep_set
 
+# --- AI "học" dạng cầu và dự đoán ---
+def ai_predict_from_cau_history(current_cau_pattern, full_cau_history_deque, min_pattern_length=3):
+    """
+    AI đơn giản học hỏi từ lịch sử cầu dài hạn.
+    Tìm kiếm các mẫu cầu tương tự trong full_cau_history_deque
+    và dự đoán kết quả tiếp theo dựa trên tần suất.
+    
+    Args:
+        current_cau_pattern (str): Chuỗi cầu hiện tại (ví dụ: 'TTX' nếu đang ở phiên thứ 3 của chuỗi).
+                                   Chúng ta sẽ dùng 3-5 ký tự cuối cùng của chuỗi cầu hiện tại.
+        full_cau_history_deque (deque): Lịch sử cầu dài hạn (deque of chars 'T' or 'X').
+        min_pattern_length (int): Độ dài tối thiểu của mẫu cầu để AI bắt đầu tìm kiếm.
+    
+    Returns:
+        tuple: (prediction_char: 'T'/'X', confidence: float) hoặc (None, 0.0) nếu không đủ dữ liệu.
+    """
+    
+    if len(full_cau_history_deque) < min_pattern_length + 1:
+        return None, 0.0 # Không đủ lịch sử để học
+    
+    # Chuyển deque thành chuỗi để tìm kiếm
+    full_history_str = "".join(list(full_cau_history_deque))
+    
+    # Lấy một đoạn mẫu từ cầu hiện tại để tìm kiếm
+    # Tối đa 5 ký tự, tối thiểu min_pattern_length
+    search_pattern = current_cau_pattern[-5:] 
+    if len(search_pattern) < min_pattern_length:
+        return None, 0.0 # Mẫu hiện tại quá ngắn để AI học
+
+    # Đếm số lần xuất hiện của mẫu và kết quả tiếp theo
+    next_results = {'T': 0, 'X': 0}
+    
+    # Lặp qua lịch sử dài hạn để tìm mẫu
+    for i in range(len(full_history_str) - len(search_pattern)):
+        if full_history_str[i:i + len(search_pattern)] == search_pattern:
+            # Nếu tìm thấy mẫu, kiểm tra kết quả ngay sau đó
+            if i + len(search_pattern) < len(full_history_str):
+                next_char = full_history_str[i + len(search_pattern)]
+                if next_char in next_results:
+                    next_results[next_char] += 1
+    
+    total_matches = next_results['T'] + next_results['X']
+    
+    if total_matches == 0:
+        return None, 0.0 # Không tìm thấy mẫu nào trong lịch sử
+    
+    if next_results['T'] > next_results['X']:
+        return 'T', next_results['T'] / total_matches
+    elif next_results['X'] > next_results['T']:
+        return 'X', next_results['X'] / total_matches
+    else:
+        # Nếu bằng nhau, không có khuyến nghị mạnh mẽ
+        return None, 0.0 # Hoặc bạn có thể chọn một giá trị mặc định
+
 # --- Lấy dữ liệu từ API ---
 def get_latest_data_from_api():
     try:
@@ -142,7 +198,7 @@ def get_latest_data_from_api():
 
 # --- Logic chính của Bot (Vòng lặp dự đoán) ---
 def prediction_loop():
-    global last_processed_session, history_data, cau_history, last_prediction_message_id
+    global last_processed_session, history_data, cau_history, long_term_cau_history, last_prediction_message_id
 
     while True:
         try:
@@ -161,78 +217,104 @@ def prediction_loop():
                 if current_session and current_session > last_processed_session and \
                    all(d is not None for d in [xuc_xac_1, xuc_xac_2, xuc_xac_3, current_session, current_result_text, total_dice]):
                     
-                    print(f"Phát hiện phiên mới từ API: {current_session}")
+                    print(f"\n--- Phát hiện phiên mới từ API: {current_session} ---")
 
                     # Kiểm tra tính liên tục của phiên
                     if history_data and history_data[-1][3] != current_session - 1:
                         print(f"Cảnh báo: Mất phiên. Cuối cùng trong lịch sử: {history_data[-1][3]}, phiên hiện tại từ API: {current_session}. Reset lịch sử để tránh sai lệch.")
                         history_data = []
                         cau_history = []
+                        # Không reset long_term_cau_history vì nó lưu lịch sử dài hạn, mất phiên không ảnh hưởng nhiều
                     elif not history_data and last_processed_session != 0 and current_session != last_processed_session + 1:
-                        # Nếu lịch sử rỗng nhưng bot đã xử lý phiên trước đó,
-                        # và phiên hiện tại không phải là phiên kế tiếp của last_processed_session
-                        print(f"Cảnh báo: Mất phiên khi lịch sử rỗng. Phiên cuối xử lý: {last_processed_session}, phiên hiện tại từ API: {current_session}. Reset last_processed_session.")
-                        last_processed_session = 0 # Reset để bắt đầu thu thập lại
+                        print(f"Cảnh báo: Lịch sử rỗng và mất phiên. Phiên cuối xử lý: {last_processed_session}, phiên hiện tại từ API: {current_session}. Reset last_processed_session.")
+                        last_processed_session = 0
 
-                    # Cập nhật lịch sử xí ngầu và cầu
+                    # Cập nhật lịch sử xí ngầu (cho dự đoán xí ngầu)
                     history_data.append((xuc_xac_1, xuc_xac_2, xuc_xac_3, current_session))
                     if len(history_data) > 5:
                         history_data.pop(0)
 
+                    # Cập nhật lịch sử cầu ngắn hạn (cho cầu xấu/đẹp 5 phiên)
                     cau_history.append((current_result_char, current_session))
                     if len(cau_history) > 5:
                         cau_history.pop(0)
                     
+                    # Cập nhật lịch sử cầu dài hạn (cho AI học hỏi)
+                    long_term_cau_history.append(current_result_char)
+
                     last_processed_session = current_session # Cập nhật phiên đã xử lý
 
-                    current_cau_str = "".join([item[0] for item in cau_history])
+                    current_cau_str_short = "".join([item[0] for item in cau_history])
+                    current_cau_str_long = "".join(list(long_term_cau_history))
                     
                     print(f"Lịch sử xí ngầu ({len(history_data)}): {history_data}")
-                    print(f"Lịch sử cầu ({len(cau_history)}): {current_cau_str}")
+                    print(f"Lịch sử cầu ngắn ({len(cau_history)}): {current_cau_str_short}")
+                    print(f"Lịch sử cầu dài ({len(long_term_cau_history)}): {current_cau_str_long}")
                     print(f"Kết quả phiên {current_session}: {current_result_text} (Tổng: {total_dice} - Xí ngầu: {xuc_xac_1}, {xuc_xac_2}, {xuc_xac_3})")
 
-                    # Chỉ dự đoán khi có đủ 5 phiên lịch sử
+                    # Dự đoán và gửi thông báo nếu đủ điều kiện
+                    prediction_message_parts = []
+                    
+                    # --- Phần dự đoán từ thuật toán xí ngầu + cầu xấu/đẹp 5 phiên ---
                     if len(history_data) >= 5 and len(cau_history) >= 5:
                         prediction_full = du_doan_theo_xi_ngau(history_data)
                         prediction_char = 'T' if prediction_full == 'Tài' else 'X'
 
-                        reason = "[AI] Phân tích xí ngầu."
-                        if len(current_cau_str) == 5:
-                            if is_cau_xau(current_cau_str):
-                                print(f"⚠️  Cảnh báo: CẦU XẤU ({current_cau_str})! Đảo ngược kết quả.")
-                                prediction_char = 'X' if prediction_char == 'T' else 'T'
-                                reason = f"[AI] Cầu xấu ({current_cau_str}) -> Đảo ngược kết quả."
-                            elif is_cau_dep(current_cau_str):
-                                print(f"✅ Cầu đẹp ({current_cau_str}) – Giữ nguyên kết quả.")
-                                reason = f"[AI] Cầu đẹp ({current_cau_str}) -> Giữ nguyên kết quả."
+                        reason_tx = "[AI (Cũ)] Phân tích xí ngầu."
+                        if len(current_cau_str_short) == 5:
+                            if is_cau_xau(current_cau_str_short):
+                                prediction_char = 'X' if prediction_char == 'T' else 'T' # Đảo ngược
+                                reason_tx = f"[AI (Cũ)] Cầu xấu (`{current_cau_str_short}`) -> Đảo ngược."
+                            elif is_cau_dep(current_cau_str_short):
+                                reason_tx = f"[AI (Cũ)] Cầu đẹp (`{current_cau_str_short}`) -> Giữ nguyên."
                             else:
-                                print(f"ℹ️  Không phát hiện cầu xấu/đẹp rõ ràng ({current_cau_str})")
-                                reason = f"[AI] Không phát hiện cầu xấu/đẹp rõ ràng ({current_cau_str})."
-                        else: # Trường hợp này không nên xảy ra nếu len(cau_history) >= 5
-                            reason = f"[AI] Cần thêm {5 - len(current_cau_str)} phiên để phân tích cầu."
-                            
-                        final_prediction_text = 'Tài' if prediction_char == 'T' else 'Xỉu'
+                                reason_tx = f"[AI (Cũ)] Cầu (`{current_cau_str_short}`) không rõ ràng."
+                        
+                        final_prediction_text_tx = 'Tài' if prediction_char == 'T' else 'Xỉu'
+                        
+                        prediction_message_parts.append(
+                            f"🤖 Dự đoán (Xí ngầu + Cầu 5p): **{final_prediction_text_tx}**\n"
+                            f"➡️ _Lý do:_ {reason_tx}"
+                        )
+                    else:
+                        prediction_message_parts.append(
+                            f"⏳ _Cần thêm {5 - len(history_data)} phiên xí ngầu để dự đoán theo xí ngầu._"
+                        )
+                    
+                    # --- Phần dự đoán từ AI mới (học hỏi dạng cầu dài hạn) ---
+                    ai_prediction_char, ai_confidence = ai_predict_from_cau_history(
+                        current_cau_str_long, long_term_cau_history, min_pattern_length=3
+                    )
+                    
+                    if ai_prediction_char:
+                        ai_prediction_text = 'Tài' if ai_prediction_char == 'T' else 'Xỉu'
+                        prediction_message_parts.append(
+                            f"🧠 Dự đoán (AI2 test): **{ai_prediction_text}** (Độ tin cậy: {ai_confidence:.0%})\n"
+                            f"➡️ _Lý do:_ Dựa trên phân tích mẫu cầu dài hạn."
+                        )
+                    else:
+                        prediction_message_parts.append(
+                            f"🧠 _AI đang thập thêm dữ liệu._ (Lịch sử: {len(long_term_cau_history)} phiên)"
+                        )
 
+                    # --- Gửi tin nhắn tổng hợp ---
+                    if prediction_message_parts: # Chỉ gửi nếu có ít nhất một phần dự đoán
                         message_text = (
                             f"🎮 Kết quả phiên hiện tại: **{current_result_text}** (Tổng: {total_dice})\n"
                             f"🔢 Phiên: `{current_session}` → `{current_session + 1}`\n"
-                            f"🤖 Dự đoán: **{final_prediction_text}**\n"
-                            f"📌 Lý do: {reason}\n"
+                            f"{'\n'.join(prediction_message_parts)}\n\n"
                             f"⚠️ Hãy đặt cược sớm trước khi phiên kết thúc!"
                         )
-                        
-                        # Gửi dự đoán đến tất cả người dùng có quyền truy cập
+
                         for user_id_str, user_info in user_data.items():
                             user_id = int(user_id_str)
                             is_sub, sub_message = check_subscription(user_id)
                             if is_sub:
                                 try:
-                                    # Xóa tin nhắn dự đoán cũ nếu có
                                     if user_id in last_prediction_message_id:
                                         try:
                                             bot.delete_message(user_id, last_prediction_message_id[user_id])
                                         except telebot.apihelper.ApiTelegramException as e:
-                                            # Bỏ qua lỗi nếu tin nhắn không tìm thấy để xóa (ví dụ: đã quá cũ)
                                             if "message to delete not found" not in str(e).lower():
                                                 print(f"Lỗi khi xóa tin nhắn cũ cho user {user_id}: {e}")
                                         except Exception as e:
@@ -242,19 +324,17 @@ def prediction_loop():
                                     last_prediction_message_id[user_id] = sent_message.message_id
                                     print(f"Gửi dự đoán cho user {user_id}")
                                 except telebot.apihelper.ApiTelegramException as e:
-                                    # Xử lý lỗi khi bot không thể gửi tin nhắn (ví dụ: người dùng đã chặn bot)
                                     if "bot was blocked by the user" in str(e).lower():
                                         print(f"Người dùng {user_id} đã chặn bot. Không gửi tin nhắn.")
                                     else:
                                         print(f"Lỗi API Telegram khi gửi dự đoán cho user {user_id}: {e}")
                                 except Exception as e:
                                     print(f"Lỗi không xác định khi gửi dự đoán cho user {user_id}: {e}")
-                            # else: # Không in dòng này để log không quá dài, chỉ in khi debug
-                            #     print(f"User {user_id} không có quyền truy cập, không gửi dự đoán.")
-
+                                    
                     else:
-                        print(f"Chưa đủ 5 phiên lịch sử để dự đoán. Hiện có: {len(history_data)} phiên xí ngầu, {len(cau_history)} phiên cầu.")
-                # else: # Không in dòng này để log không quá dài
+                        print(f"Không có đủ dữ liệu để tạo tin nhắn dự đoán.")
+
+                # else: # Log này có thể gây nhiễu nếu API cập nhật chậm
                 #     print(f"Không có phiên mới hoặc dữ liệu không đầy đủ. Phiên hiện tại: {current_session}, Phiên cuối xử lý: {last_processed_session}")
             else:
                 print("Không nhận được dữ liệu từ API hoặc dữ liệu trống.")
@@ -264,7 +344,7 @@ def prediction_loop():
         
         time.sleep(5) # Kiểm tra API mỗi 5 giây
 
-# --- Xử lý lệnh Telegram ---
+# --- Xử lý lệnh Telegram (Không thay đổi các lệnh này) ---
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -462,7 +542,7 @@ def extend_subscription(message):
 # --- Lệnh Admin/CTV: Nhập lịch sử thủ công ---
 @bot.message_handler(commands=['ls'])
 def set_manual_history(message):
-    global history_data, cau_history, last_processed_session
+    global history_data, cau_history, long_term_cau_history, last_processed_session
 
     if not is_ctv(message.chat.id):
         bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
@@ -499,22 +579,20 @@ def set_manual_history(message):
     # Reset lịch sử hiện tại
     history_data = []
     cau_history = []
+    long_term_cau_history.clear() # Xóa lịch sử dài hạn khi nhập thủ công
 
-    # Cập nhật lịch sử cầu từ chuỗi nhập vào
+    # Cập nhật lịch sử cầu ngắn hạn từ chuỗi nhập vào
     current_session_for_cau = session_id_input - (len(cau_str_input) - 1)
     for char in cau_str_input:
         cau_history.append((char, current_session_for_cau))
+        long_term_cau_history.append(char) # Thêm vào cả lịch sử dài hạn
         current_session_for_cau += 1
 
     # Cập nhật lịch sử xí ngầu
-    # Để đảm bảo history_data có đủ 5 phần tử và phiên cuối cùng khớp với input
-    # chúng ta sẽ tạo các phiên xí ngầu "giả" cho 4 phiên trước đó
-    # Điều này giúp thuật toán `du_doan_theo_xi_ngau` có đủ dữ liệu ngay lập tức.
     for i in range(4):
-        history_data.append((1, 1, 1, session_id_input - (4 - i))) # Sử dụng 1,1,1 làm placeholder
+        history_data.append((1, 1, 1, session_id_input - (4 - i)))
     history_data.append((dice_inputs[0], dice_inputs[1], dice_inputs[2], session_id_input))
 
-    # Cập nhật last_processed_session để bot biết phiên cuối cùng đã là phiên này
     last_processed_session = session_id_input
 
     bot.reply_to(message, 
@@ -524,12 +602,13 @@ def set_manual_history(message):
                  f"Bot sẽ tiếp tục dự đoán từ phiên `{session_id_input + 1}`.", parse_mode='Markdown')
     
     print(f"Admin/CTV {message.chat.id} đã cập nhật lịch sử thủ công:")
-    print(f"  cau_history: {cau_history}")
+    print(f"  cau_history (short): {cau_history}")
+    print(f"  long_term_cau_history: {list(long_term_cau_history)}") # Chuyển deque sang list để in
     print(f"  history_data: {history_data}")
     print(f"  last_processed_session: {last_processed_session}")
 
 
-# --- Lệnh Admin Chính ---
+# --- Lệnh Admin Chính (Không thay đổi các lệnh này) ---
 @bot.message_handler(commands=['ctv'])
 def add_ctv(message):
     if not is_admin(message.chat.id):
