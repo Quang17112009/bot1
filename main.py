@@ -24,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Cấu hình Bot ---
-TELEGRAM_TOKEN = "7951251597:AAEXH5OtBRxU8irZS1S4Gh-jicRmSIOK_s" # Token của bạn đã được cập nhật
+TELEGRAM_TOKEN = "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s" # Token của bạn đã được cập nhật
 HTTP_API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
 
 # Thay thế bằng Telegram User ID của Admin chính (là bạn)
