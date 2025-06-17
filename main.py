@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # --- Cấu hình Bot (Hardcode - CẢNH BÁO: RỦI RO BẢO MẬT CAO!) ---
 # Đã gắn token bot Telegram của bạn vào đây:
-TELEGRAM_TOKEN = "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s" 
+TELEGRAM_TOKEN = "7956593401:AAH-7zW1Hyr8Ak6GmEHiKcushkap2FWoxsw" 
 
 # Đã gắn ID Telegram admin của bạn vào đây:
 ADMIN_ID = 6915752059 # Đây là số nguyên, không có dấu nháy kép
