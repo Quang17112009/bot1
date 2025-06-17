@@ -1,230 +1,222 @@
 import logging
 from collections import deque
-import json # Được giữ lại phòng trường hợp cần dùng cho các cấu hình AI phức tạp hơn
 
 logger = logging.getLogger(__name__)
 
-# --- Cấu hình cho AI ---
-# Độ dài lịch sử mà các AI cần để phân tích. Phải khớp với database.py.
-HISTORY_LENGTH = 13 
-# Định nghĩa khoảng điểm tối thiểu/tối đa cho AI để tránh điểm quá thấp/cao
-MIN_AI_SCORE = 50.0
-MAX_AI_SCORE = 150.0
+# Các mẫu dự đoán sẽ được tải từ file dudoan.txt
+# Sẽ lưu dưới dạng list of dict: [{'pattern': 'TTTTTTTTTTTTT', 'predict': 'T', 'type': 'Cầu bệt'}, ...]
+PREDICTION_PATTERNS = []
 
-# Dữ liệu mẫu sẽ được tải từ dudoan.txt
-# key: chuỗi 13 ký tự ('T' hoặc 'X'), value: {'prediction': 'T'/'X', 'type': 'Mô tả cầu'}
-pattern_data = {} 
-
-def load_patterns(filepath="dudoan.txt"):
-    """Tải các mẫu dự đoán từ file dudoan.txt vào bộ nhớ."""
-    global pattern_data
-    loaded_count = 0
+def load_patterns():
+    """Tải các mẫu từ file dudoan.txt."""
+    global PREDICTION_PATTERNS
+    PREDICTION_PATTERNS = [] # Reset để tránh trùng lặp nếu gọi nhiều lần
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open('dudoan.txt', 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('#'):
-                    continue # Bỏ qua dòng trống hoặc comment
+                if not line: # Bỏ qua dòng trống
+                    continue
                 
-                parts = line.split('=> Dự đoán: ')
+                parts = line.split('=>')
                 if len(parts) == 2:
-                    pattern_str = parts[0].strip() # Chuỗi 13 ký tự T/X
-                    prediction_info_str = parts[1].strip()
+                    pattern_and_predict_part = parts[0].strip() # "TTTTTTTTTTTTT"
+                    type_part = parts[1].strip() # "Dự đoán: T - Loại cầu: Cầu bệt (liên tiếp giống nhau)"
 
-                    pred_parts = prediction_info_str.split(' - Loại cầu: ')
-                    if len(pred_parts) == 2:
-                        prediction_char = pred_parts[0].replace('Tài', 'T').replace('Xỉu', 'X').strip()[0] # Chuẩn hóa thành 'T' hoặc 'X'
-                        pattern_type = pred_parts[1].strip()
-                        
-                        if len(pattern_str) == HISTORY_LENGTH and prediction_char in ['T', 'X']:
-                            pattern_data[pattern_str] = {'prediction': prediction_char, 'type': pattern_type}
-                            loaded_count += 1
-                        else:
-                            logger.warning(f"Mẫu '{pattern_str}' không đúng độ dài {HISTORY_LENGTH} hoặc dự đoán không hợp lệ. Bỏ qua.")
+                    # Tách phần dự đoán khỏi phần mẫu
+                    pattern_match = pattern_and_predict_part.split('Dự đoán:')
+                    if len(pattern_match) == 2:
+                        pattern_str = pattern_match[0].strip() # Lấy phần mẫu: TTTTTTTTTTTTT
+                        predict_char = pattern_match[1].strip() # Lấy ký tự dự đoán: T
+
+                        # Tách loại cầu
+                        type_match = type_part.split('Loại cầu:')
+                        type_name = type_match[1].strip() if len(type_match) == 2 else 'N/A'
+
+                        PREDICTION_PATTERNS.append({
+                            'pattern': pattern_str,
+                            'predict': predict_char,
+                            'type': type_name
+                        })
                     else:
-                        logger.warning(f"Dòng '{line}' không đúng định dạng 'Dự đoán: KẾT_QUẢ - Loại cầu: MÔ_TẢ'. Bỏ qua.")
+                        logger.warning(f"Invalid pattern format (missing 'Dự đoán:') in line: {line}")
                 else:
-                    logger.warning(f"Dòng '{line}' không đúng định dạng 'CHUỖI => Dự đoán: ...'. Bỏ qua.")
-        logger.info(f"Loaded {loaded_count} patterns from {filepath}.")
-        if loaded_count == 0 and HISTORY_LENGTH == 13: 
-             logger.warning("Không tìm thấy mẫu nào. Đảm bảo dudoan.txt tồn tại và định dạng đúng (13 ký tự T/X).")
+                    logger.warning(f"Invalid line format (missing '=>') in dudoan.txt: {line}")
+                    
+        logger.info(f"Loaded {len(PREDICTION_PATTERNS)} patterns from dudoan.txt.")
     except FileNotFoundError:
-        logger.error(f"Lỗi: File dudoan.txt không tìm thấy tại {filepath}. AI3 sẽ không hoạt động.")
+        logger.warning("dudoan.txt not found. Pattern AI will not function.")
+        PREDICTION_PATTERNS = []
     except Exception as e:
-        logger.error(f"Lỗi khi tải mẫu từ {filepath}: {e}")
+        logger.error(f"Error loading patterns from dudoan.txt: {e}")
+        PREDICTION_PATTERNS = []
 
-# --- Các AI dự đoán ---
-
-# AI 1: Phân tích Xu hướng & Tỷ lệ
-def predict_ai1_trend(history: deque):
-    """
-    Dự đoán dựa trên các xu hướng cơ bản: chuỗi bệt, cầu 1-1, và tỷ lệ chiếm ưu thế.
-    Trả về 'T' hoặc 'X', hoặc None nếu không có dự đoán rõ ràng.
-    """
-    if len(history) < 5: # Cần ít nhất 5 phiên để phân tích xu hướng có ý nghĩa
+def ai1_trend_predictor(history: deque):
+    """AI dựa trên xu hướng: dự đoán tiếp tục xu hướng gần nhất (3-5 phiên)."""
+    if len(history) < 3: # Cần ít nhất 3 phiên để nhận biết xu hướng
         return None 
-
-    last_results = list(history) # Chuyển đổi deque thành list để dễ thao tác
-    tai_count = last_results.count("T")
-    xiu_count = last_results.count("X")
-
-    # Ưu tiên chuỗi bệt (3 hoặc hơn)
-    if len(last_results) >= 3 and last_results[-1] == last_results[-2] == last_results[-3]:
-        return last_results[-1] # Dự đoán tiếp tục chuỗi
-
-    # Ưu tiên mẫu 1-1 (tắc) nếu có đủ 4 phiên cuối
-    if len(last_results) >= 4 and \
-       last_results[-1] != last_results[-2] and \
-       last_results[-2] != last_results[-3] and \
-       last_results[-3] != last_results[-4]:
-        # Nếu là A-B-A-B (ví dụ T-X-T-X), thì dự đoán A (T)
-        return last_results[-3] 
     
-    # Dự đoán theo xu hướng chiếm ưu thế trong tổng thể lịch sử ngắn
-    if tai_count > xiu_count and (tai_count / len(last_results)) >= 0.6: # Tài chiếm > 60%
-        return "T"
-    elif xiu_count > tai_count and (xiu_count / len(last_results)) >= 0.6: # Xỉu chiếm > 60%
-        return "X"
+    last_3 = list(history)[-3:]
+    # Nếu 3 phiên gần nhất đều là T, dự đoán T
+    if all(x == 'T' for x in last_3):
+        return {'predict': 'T', 'type': 'Cầu bệt T (ngắn)'}
+    # Nếu 3 phiên gần nhất đều là X, dự đoán X
+    if all(x == 'X' for x in last_3):
+        return {'predict': 'X', 'type': 'Cầu bệt X (ngắn)'}
     
-    return None # Không có dự đoán rõ ràng
+    # Nếu là chuỗi luân phiên (TXT, TXT), dự đoán ngược lại
+    if len(history) >= 2:
+        last_2 = list(history)[-2:]
+        if last_2[0] != last_2[1]: # Ví dụ TX hoặc XT
+            # Dự đoán tiếp tục luân phiên
+            return {'predict': 'T' if last_2[1] == 'X' else 'X', 'type': 'Cầu luân phiên'}
 
-# AI 2: Nhận diện Cầu xấu / Dự đoán Phòng thủ
-def predict_ai2_defensive(history: deque, consecutive_errors: int):
+    return None # Không có xu hướng rõ ràng
+
+def ai2_defensive_predictor(history: deque, consecutive_errors: int):
     """
-    AI này theo dõi số lần sai liên tiếp của chính nó.
-    Nếu sai 3 lần trở lên, nó sẽ chuyển sang chế độ "dự đoán phòng thủ" (dự đoán ngược lại kết quả cuối cùng).
+    AI phòng thủ:
+    - Bình thường: Dự đoán ngược lại với phiên gần nhất (phương pháp Martingale ngược).
+    - Nếu đã 'gãy' 2 lần liên tiếp (tức là 2 lần sai), thì dự đoán theo xu hướng (giống AI1 hoặc chiến lược khác)
+      (Dựa vào lưu ý của bạn: "cứ 2 lần phân tích MD5 cho kết quả 'Gãy' thì sẽ có 1 lần cho kết quả khác")
+      -> Ở đây tôi hiểu là nếu AI2 sai liên tiếp 2 lần, lần thứ 3 nó sẽ dùng chiến lược khác (ví dụ: xu hướng).
+         Và sau lần dự đoán khác đó, nó sẽ quay lại chiến lược ban đầu (dự đoán ngược).
     """
-    if len(history) == 0:
+    if not history:
         return None
 
-    if consecutive_errors >= 3:
-        # Nếu đang trong chuỗi sai, dự đoán phòng thủ: ngược lại với kết quả cuối cùng
-        last_actual_result = history[-1]
-        defensive_prediction = "X" if last_actual_result == "T" else "T"
-        logger.info(f"AI2 (Defensive Mode): {consecutive_errors} consecutive errors. Predicting {defensive_prediction} (opposite of last result).")
-        return defensive_prediction
-    
-    # Khi không trong chế độ phòng thủ, AI2 sẽ dự đoán theo logic của AI1
-    # hoặc bạn có thể phát triển một logic riêng khác cho nó ở trạng thái bình thường.
-    return predict_ai1_trend(history) 
+    last_result = history[-1]
 
-# AI 3: Dựa trên Mẫu hình dudoan.txt
-def predict_ai3_pattern(history: deque):
-    """
-    Tìm kiếm chuỗi 13 phiên lịch sử trong các mẫu từ dudoan.txt.
-    Trả về dự đoán từ mẫu, hoặc None nếu không tìm thấy mẫu.
-    """
-    if len(history) < HISTORY_LENGTH: # Cần đủ 13 phiên để tạo chuỗi so sánh
+    # Kiểm tra quy tắc "cứ 2 lần gãy thì 1 lần khác"
+    # consecutive_errors = 0: chưa sai
+    # consecutive_errors = 1: sai 1 lần
+    # consecutive_errors = 2: sai 2 lần -> lần này cần dự đoán khác
+    if consecutive_errors == 2:
+        # Nếu đã sai 2 lần liên tiếp, dự đoán theo xu hướng (dùng lại logic của AI1)
+        logger.debug("AI2 in defensive mode (after 2 consecutive errors). Using trend predictor.")
+        trend_pred = ai1_trend_predictor(history)
+        if trend_pred:
+            return {'predict': trend_pred['predict'], 'type': f"Phòng thủ ({trend_pred['type']})"}
+        else:
+            # Nếu AI1 cũng không có xu hướng, quay lại dự đoán ngược
+            return {'predict': 'T' if last_result == 'X' else 'X', 'type': 'Phòng thủ (Ngược)'}
+    else:
+        # Bình thường: dự đoán ngược lại
+        return {'predict': 'T' if last_result == 'X' else 'X', 'type': 'Phòng thủ (Ngược)'}
+
+
+def ai3_pattern_predictor(history: deque):
+    """AI dựa trên mẫu: tìm kiếm các mẫu đã biết trong lịch sử và trả về dự đoán cùng loại cầu."""
+    if not PREDICTION_PATTERNS or not history:
         return None
-    
-    current_pattern_string = "".join(list(history)) # Chuyển deque thành chuỗi "TTX..."
-    
-    if current_pattern_string in pattern_data:
-        prediction_info = pattern_data[current_pattern_string]
-        return prediction_info['prediction']
-    
-    return None # Không tìm thấy mẫu khớp
 
-# --- Cơ chế Tổng hợp & Cập nhật điểm ---
+    current_history_str = "".join(list(history)) # Chuyển deque thành chuỗi
+
+    # Ưu tiên các mẫu dài hơn để tìm kiếm mẫu chính xác hơn
+    sorted_patterns = sorted(PREDICTION_PATTERNS, key=lambda x: len(x['pattern']), reverse=True)
+
+    for pattern_data in sorted_patterns:
+        pattern_str = pattern_data['pattern']
+        
+        # Để khớp với các mẫu "TTTXXX" mà dự đoán dựa trên toàn bộ mẫu đó
+        # (ví dụ TTT => T thì pattern_str sẽ là TTT và predict là T)
+        # Chúng ta cần kiểm tra nếu history kết thúc bằng pattern_str (trước khi dự đoán)
+        if current_history_str.endswith(pattern_str):
+            logger.debug(f"AI3 found exact pattern '{pattern_str}' in history. Predicting '{pattern_data['predict']}'")
+            return {'predict': pattern_data['predict'], 'type': pattern_data['type']}
+        
+    return None # Không tìm thấy mẫu nào khớp
+
 
 def ensemble_predict(history: deque, ai_scores: dict, ai2_consecutive_errors: int):
     """
-    Tổng hợp dự đoán từ 3 AI dựa trên điểm số hiện tại của chúng.
-    Trả về dự đoán cuối cùng ('Tài'/'Xỉu') và dự đoán của từng AI.
+    Kết hợp dự đoán từ các AI khác nhau dựa trên điểm số/trọng số.
     """
-    # Lấy dự đoán từ mỗi AI
-    pred1_char = predict_ai1_trend(history)
-    pred2_char = predict_ai2_defensive(history, ai2_consecutive_errors)
-    pred3_char = predict_ai3_pattern(history)
+    predictions_with_types = {} # {ai_name: {'predict': 'T'/'X', 'type': 'Cầu bệt'}}
+    
+    # AI1: Xu hướng
+    ai1_result = ai1_trend_predictor(history)
+    if ai1_result:
+        predictions_with_types['ai1_trend'] = ai1_result
+    
+    # AI2: Phòng thủ
+    ai2_result = ai2_defensive_predictor(history, ai2_consecutive_errors)
+    if ai2_result:
+        predictions_with_types['ai2_defensive'] = ai2_result
 
-    # Dictionary để lưu trữ tổng điểm của Tài và Xỉu
-    weighted_votes = {"T": 0.0, "X": 0.0}
-    ai_predictions = {} # Lưu lại dự đoán của từng AI để cập nhật điểm sau
+    # AI3: Mẫu
+    ai3_result = ai3_pattern_predictor(history)
+    if ai3_result:
+        predictions_with_types['ai3_pattern'] = ai3_result
 
-    # AI 1
-    if pred1_char:
-        score1 = ai_scores.get('ai1_trend', 100.0)
-        weighted_votes[pred1_char] += score1
-        ai_predictions['ai1_trend'] = pred1_char
-        logger.debug(f"AI1: {pred1_char} (Score: {score1})")
+    # Tính toán dự đoán cuối cùng
+    weighted_votes = {'T': 0.0, 'X': 0.0}
+    ai_individual_predictions_char = {} # Chỉ lưu ký tự dự đoán cho phần cập nhật điểm
+
+    for ai_name, pred_data in predictions_with_types.items():
+        score = ai_scores.get(ai_name, 100.0) # Lấy điểm từ DB, mặc định 100
+        weighted_votes[pred_data['predict']] += score
+        ai_individual_predictions_char[ai_name] = pred_data['predict'] # Lưu ký tự dự đoán
+
+    final_prediction_char = 'T' if weighted_votes['T'] >= weighted_votes['X'] else 'X' # Chọn T nếu hòa hoặc T cao hơn
+    
+    # Chọn loại cầu ưu tiên từ AI có trọng số cao nhất hoặc AI có dự đoán trùng với final_prediction_char
+    final_type = "Không rõ"
+    max_score_for_final_pred = -1
+    for ai_name, pred_data in predictions_with_types.items():
+        if pred_data['predict'] == final_prediction_char:
+            score = ai_scores.get(ai_name, 100.0)
+            if score > max_score_for_final_pred:
+                max_score_for_final_pred = score
+                final_type = pred_data['type']
+
+
+    final_prediction_display = f"{final_prediction_char} ({final_type})"
+    if final_prediction_char == 'T':
+        final_prediction_display = f"Tài ({final_type})"
     else:
-        ai_predictions['ai1_trend'] = None
+        final_prediction_display = f"Xỉu ({final_type})"
 
-    # AI 2
-    if pred2_char:
-        score2 = ai_scores.get('ai2_defensive', 100.0)
-        weighted_votes[pred2_char] += score2
-        ai_predictions['ai2_defensive'] = pred2_char
-        logger.debug(f"AI2: {pred2_char} (Score: {score2})")
-    else:
-        ai_predictions['ai2_defensive'] = None
+    logger.info(f"Ensemble raw predictions: {predictions_with_types}. Weighted votes: {weighted_votes}. Final char: {final_prediction_char}, Type: {final_type}")
+    
+    return final_prediction_display, ai_individual_predictions_char
 
-    # AI 3
-    if pred3_char:
-        score3 = ai_scores.get('ai3_pattern', 100.0)
-        weighted_votes[pred3_char] += score3
-        ai_predictions['ai3_pattern'] = pred3_char
-        logger.debug(f"AI3: {pred3_char} (Score: {score3})")
-    else:
-        ai_predictions['ai3_pattern'] = None
-
-    logger.debug(f"Weighted votes: Tài={weighted_votes['T']:.2f}, Xỉu={weighted_votes['X']:.2f}")
-
-    # Quyết định dự đoán cuối cùng
-    final_prediction_char = None
-    if weighted_votes["T"] > weighted_votes["X"]:
-        final_prediction_char = "T"
-    elif weighted_votes["X"] > weighted_votes["T"]:
-        final_prediction_char = "X"
-    else:
-        # Nếu hòa điểm, ưu tiên AI1 nếu nó có dự đoán, hoặc AI2, AI3
-        if pred1_char: final_prediction_char = pred1_char
-        elif pred2_char: final_prediction_char = pred2_char
-        elif pred3_char: final_prediction_char = pred3_char
-        # Nếu tất cả đều không dự đoán hoặc hòa và không có ưu tiên, mặc định là Tài
-        else: final_prediction_char = "T" # Hoặc None để báo "không rõ ràng"
-
-    # Chuyển đổi ký tự dự đoán thành 'Tài' hoặc 'Xỉu' để hiển thị
-    final_prediction_display = "Tài" if final_prediction_char == "T" else "Xỉu" if final_prediction_char == "X" else "Không rõ ràng"
-        
-    return final_prediction_display, ai_predictions
 
 def update_ai_scores_and_states(
     actual_result_char: str, 
-    ai_predictions: dict, 
+    ai_individual_predictions: dict, # Dictionary chỉ chứa ký tự dự đoán của từng AI
     ai_scores: dict, 
-    ai2_current_errors: int, 
-    db_update_score_func, 
-    db_update_state_func
+    ai2_consecutive_errors: int,
+    update_ai_score_func, 
+    update_ai_state_func 
 ):
     """
-    Cập nhật điểm của các AI và trạng thái của AI2 dựa trên kết quả thực tế.
+    Cập nhật điểm số của các AI và trạng thái của AI2 dựa trên kết quả thực tế.
     """
-    new_ai2_errors = ai2_current_errors
-
-    for ai_name, pred_char in ai_predictions.items():
-        if pred_char is None:
-            continue # AI không đưa ra dự đoán, không cập nhật điểm
-
-        current_score = ai_scores.get(ai_name, 100.0) # Lấy điểm hiện tại từ dictionary truyền vào
+    for ai_name, predicted_char in ai_individual_predictions.items():
+        current_score = ai_scores.get(ai_name, 100.0)
         
-        if pred_char == actual_result_char:
-            new_score = min(MAX_AI_SCORE, current_score + 1.0) # Tăng điểm khi đúng
-            if ai_name == 'ai2_defensive':
-                new_ai2_errors = 0 # Reset lỗi liên tiếp của AI2 nếu đúng
-            logger.debug(f"AI {ai_name} predicted correctly. New score: {new_score:.2f}. AI2 errors: {new_ai2_errors}")
+        if predicted_char == actual_result_char:
+            # AI dự đoán đúng, tăng điểm
+            new_score = current_score * 1.05 # Tăng 5%
+            logger.info(f"AI {ai_name} predicted correctly. Score: {current_score:.0f} -> {new_score:.0f}")
+            if ai_name == 'ai2_defensive': # Reset lỗi liên tiếp nếu AI2 đúng
+                update_ai_state_func('ai2_defensive', 0)
         else:
-            new_score = max(MIN_AI_SCORE, current_score - 2.0) # Giảm điểm nhiều hơn khi sai
-            if ai_name == 'ai2_defensive':
-                new_ai2_errors += 1 # Tăng lỗi liên tiếp của AI2 nếu sai
-                logger.debug(f"AI {ai_name} predicted incorrectly. New score: {new_score:.2f}. AI2 errors: {new_ai2_errors}")
-            else:
-                logger.debug(f"AI {ai_name} predicted incorrectly. New score: {new_score:.2f}.")
+            # AI dự đoán sai, giảm điểm
+            new_score = current_score * 0.95 # Giảm 5%
+            logger.info(f"AI {ai_name} predicted incorrectly. Score: {current_score:.0f} -> {new_score:.0f}")
+            if ai_name == 'ai2_defensive': # Tăng lỗi liên tiếp nếu AI2 sai
+                new_errors = ai2_consecutive_errors + 1
+                # Quy tắc bạn đã cho: "cứ 2 lần phân tích MD5 cho kết quả 'Gãy' thì sẽ có 1 lần cho kết quả khác."
+                # => Điều này ngụ ý rằng sau 2 lần sai, lần thứ 3 AI2 sẽ có một "chiến lược khác".
+                # Nếu sai lần 3,4,5... thì consecutive_errors vẫn cứ tăng.
+                # Tôi sẽ giữ nguyên logic: nếu đã sai 2 lần thì cứ để consecutive_errors = 2 cho đến khi đúng.
+                # Hoặc bạn muốn reset về 0 sau khi nó sai lần thứ 2 và chuyển sang chiến lược khác?
+                # Hiện tại, tôi sẽ không reset nó về 0 ở đây. Logic reset nằm trong AI2 predictor khi nó chọn chiến lược khác.
+                update_ai_state_func('ai2_defensive', new_errors)
         
-        db_update_score_func(ai_name, new_score) # Cập nhật điểm AI vào DB
-    
-    db_update_state_func('ai2_defensive', new_ai2_errors) # Cập nhật lỗi liên tiếp của AI2 vào DB
+        # Đảm bảo điểm không quá thấp hoặc quá cao
+        new_score = max(50.0, min(200.0, new_score)) # Giới hạn điểm từ 50 đến 200
+        update_ai_score_func(ai_name, new_score)
 
-
-# Tải các mẫu dự đoán khi module này được import lần đầu
-load_patterns()
