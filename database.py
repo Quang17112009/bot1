@@ -52,6 +52,16 @@ def init_db():
     # Khởi tạo trạng thái cho AI2 nếu chưa có
     cursor.execute("INSERT OR IGNORE INTO ai_states (ai_name, consecutive_errors) VALUES (?, ?)", ('ai2_defensive', 0))
 
+    # Bảng mới: app_settings để lưu các cài đặt chung (ví dụ: phiên cuối cùng)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    # Khởi tạo giá trị phiên cuối cùng đã xử lý nếu chưa có
+    cursor.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)", ('last_processed_phien', '0'))
+
     conn.commit()
     conn.close()
     logger.info("Database initialized successfully.")
@@ -122,5 +132,23 @@ def update_ai_state(ai_name, consecutive_errors):
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     cursor.execute("UPDATE ai_states SET consecutive_errors = ? WHERE ai_name = ?", (consecutive_errors, ai_name))
+    conn.commit()
+    conn.close()
+
+# Hàm mới để lấy/cập nhật cài đặt chung của ứng dụng
+def get_app_setting(key):
+    """Lấy giá trị của một cài đặt ứng dụng từ DB."""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+    setting = cursor.fetchone()
+    conn.close()
+    return setting[0] if setting else None
+
+def update_app_setting(key, value):
+    """Cập nhật hoặc thêm một cài đặt ứng dụng vào DB."""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", (key, str(value))) # Lưu dưới dạng TEXT
     conn.commit()
     conn.close()
