@@ -260,15 +260,15 @@ def prediction_loop():
                         prediction_full = du_doan_theo_xi_ngau(history_data)
                         prediction_char = 'T' if prediction_full == 'Tài' else 'X'
 
-                        reason_tx = "[AI (Cũ)] Phân tích xí ngầu."
+                        reason_tx = "[AI 1] Phân tích xí ngầu."
                         if len(current_cau_str_short) == 5:
                             if is_cau_xau(current_cau_str_short):
                                 prediction_char = 'X' if prediction_char == 'T' else 'T' # Đảo ngược
-                                reason_tx = f"[AI (Cũ)] Cầu xấu (`{current_cau_str_short}`) -> Đảo ngược."
+                                reason_tx = f"[AI 1] Cầu xấu (`{current_cau_str_short}`) -> Đảo ngược."
                             elif is_cau_dep(current_cau_str_short):
-                                reason_tx = f"[AI (Cũ)] Cầu đẹp (`{current_cau_str_short}`) -> Giữ nguyên."
+                                reason_tx = f"[AI 1] Cầu đẹp (`{current_cau_str_short}`) -> Giữ nguyên."
                             else:
-                                reason_tx = f"[AI (Cũ)] Cầu (`{current_cau_str_short}`) không rõ ràng."
+                                reason_tx = f"[AI 1] Cầu (`{current_cau_str_short}`) không rõ ràng."
                         
                         final_prediction_text_tx = 'Tài' if prediction_char == 'T' else 'Xỉu'
                         
@@ -459,7 +459,7 @@ def start_prediction(message):
         bot.reply_to(message, sub_message + "\nVui lòng liên hệ Admin @heheviptool hoặc @Besttaixiu999 để được hỗ trợ.", parse_mode='Markdown')
         return
     
-    bot.reply_to(message, "✅ Bạn đang có quyền truy cập. Bot sẽ tự động gửi dự đoán các phiên mới nhất tại đây.")
+    bot.reply_to(message, "✅ Bot Sunwin đã kích hoạt.")
 
 # --- Lệnh Admin/CTV ---
 @bot.message_handler(commands=['full'])
