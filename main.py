@@ -25,20 +25,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Cấu hình Bot (Hardcode - CẢNH BÁO: RỦI RO BẢO MẬT CAO!) ---
-# Đã gắn token bot Telegram của bạn vào đây:
-TELEGRAM_TOKEN = "7951251597:AAEXH5OtBRxU8irZS1S4Gh-jicRmSIOK_s" 
+# --- Cấu hình Bot (Sử dụng biến môi trường - KHUYẾN NGHỊ BẢO MẬT) ---
+# Lấy token bot Telegram từ biến môi trường
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") 
+# Lấy ID Telegram admin từ biến môi trường
+ADMIN_ID_STR = os.getenv("ADMIN_ID") # Lấy dưới dạng chuỗi
+ADMIN_ID = None
+try:
+    if ADMIN_ID_STR:
+        ADMIN_ID = int(ADMIN_ID_STR)
+except ValueError:
+    logger.critical("ADMIN_ID trong biến môi trường không phải là số nguyên hợp lệ.")
 
-# Đã gắn ID Telegram admin của bạn vào đây:
-ADMIN_ID = 6915752059 # Đây là số nguyên, không có dấu nháy kép
-
-# --------------------------------------------------------------------------------
-# CẢNH BÁO BẢO MẬT: Hardcode thông tin nhạy cảm (token, ID) vào code là 
-# KHÔNG ĐƯỢC KHUYẾN NGHỊ. Nếu code của bạn bị lộ, các thông tin này cũng sẽ bị lộ.
-# Phương pháp an toàn hơn là sử dụng Biến môi trường trên Render.
-# --------------------------------------------------------------------------------
-
-# Các kiểm tra đảm bảo giá trị hợp lệ sau khi hardcode
+# Các kiểm tra đảm bảo giá trị hợp lệ
 if not isinstance(TELEGRAM_TOKEN, str) or not TELEGRAM_TOKEN:
     logger.critical("TELEGRAM_TOKEN không hợp lệ hoặc bị thiếu. Bot không thể khởi động.")
     exit(1)
@@ -176,8 +175,8 @@ async def taixiu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.get(HTTP_API_URL) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    # TRICK: Directly use the 'Ket_qua' string from the JSON.
-                    # It should already be correctly decoded by aiohttp's .json() method.
+                    # Sử dụng trực tiếp chuỗi 'Ket_qua' từ JSON.
+                    # aiohttp.json() đã xử lý giải mã Unicode đúng cách.
                     ket_qua_display = data.get('Ket_qua', 'N/A')
                     
                     # Lấy dữ liệu từ JSON, cung cấp giá trị mặc định là 0 nếu không tìm thấy hoặc là None
@@ -253,7 +252,7 @@ Xúc xắc: {xuc_xac_1}, {xuc_xac_2}, {xuc_xac_3}
             logger.error(f"Lỗi JSON decode từ API Tài Xỉu: {e}", exc_info=True)
         except Exception as e:
             message = f"❌ Lỗi không xác định đã xảy ra: {e!s}. Vui lòng liên hệ hỗ trợ."
-            logger.error(f"Lỗi chung khi lấy dữ liệu Tài Xỉu: {e}", exc_info=True) 
+            logger.error(f"Lỗi chung khi lấy dữ liệu Tài Xỉu: {e}", exc_info=True) # exc_info để in stack trace
 
     await update.message.reply_text(message)
 
@@ -399,7 +398,7 @@ def main():
     database.init_db() # Khởi tạo cơ sở dữ liệu khi bot chạy
     prediction_engine.load_patterns() # Tải các mẫu từ dudoan.txt khi bot chạy
     
-    # Các kiểm tra TELEGRAM_TOKEN và ADMIN_ID đã hardcode được thực hiện ở đầu file
+    # Các kiểm tra TELEGRAM_TOKEN và ADMIN_ID được thực hiện ở đầu file
     # Nếu có lỗi, chương trình sẽ thoát sớm
 
     keep_alive() # Gọi hàm này để khởi động server keep-alive (cho Render)
