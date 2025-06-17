@@ -50,11 +50,11 @@ if not isinstance(ADMIN_ID, int) or ADMIN_ID <= 0:
 HTTP_API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
 
 # Danh sách user_id của các cộng tác viên (CTV)
-# Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững.
+# Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững hơn thì cần lưu vào SQLite
 CTV_IDS = set() 
 
 # Dictionary để lưu trữ thông tin người dùng (ngày hết hạn, xu). 
-# Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững.
+# Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững hơn thì cần lưu vào SQLite
 # Format: {user_id: {"expiration_date": "YYYY-MM-DD", "xu": 0}}
 user_data = {} 
 
@@ -168,25 +168,26 @@ async def nap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     await update.message.reply_text(nap_text)
 
-# --- Lệnh Tài Xỉu và Dự đoán Nâng cao ---
-async def taixiu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Hàm chung để xử lý và gửi thông báo Tài Xỉu ---
+# Hàm này sẽ được gọi bởi tác vụ định kỳ và lệnh /taixiu
+async def process_and_send_taixiu(context: ContextTypes.DEFAULT_TYPE, target_chat_id: int = None):
+    """
+    Lấy dữ liệu API, xử lý, cập nhật DB và gửi thông báo.
+    Nếu target_chat_id được cung cấp, chỉ gửi tới chat đó (dùng cho lệnh /taixiu).
+    Nếu target_chat_id là None, gửi tới tất cả người dùng hợp lệ (dùng cho tác vụ định kỳ).
+    """
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(HTTP_API_URL) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    # Sử dụng trực tiếp chuỗi 'Ket_qua' từ JSON.
-                    # aiohttp.json() đã xử lý giải mã Unicode đúng cách.
                     ket_qua_display = data.get('Ket_qua', 'N/A')
-                    
-                    # Lấy dữ liệu từ JSON, cung cấp giá trị mặc định là 0 nếu không tìm thấy hoặc là None
                     phien_number = data.get('Phien', 0) 
                     tong = data.get('Tong', 0)
                     xuc_xac_1 = data.get('Xuc_xac_1', 0)
                     xuc_xac_2 = data.get('Xuc_xac_2', 0)
                     xuc_xac_3 = data.get('Xuc_xac_3', 0) 
-                    
-                    # Chuẩn hóa kết quả về 'T' hoặc 'X' để lưu DB và phân tích AI
+
                     actual_result_char = None
                     if ket_qua_display == 'Tài':
                         actual_result_char = 'T'
@@ -194,67 +195,106 @@ async def taixiu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         actual_result_char = 'X'
 
                     if actual_result_char:
-                        # 1. Lưu kết quả mới nhất vào DB
-                        database.add_result(phien_number, ket_qua_display, actual_result_char, tong, xuc_xac_1, xuc_xac_2, xuc_xac_3)
+                        is_new_phien = False
+                        if target_chat_id is None: # Chỉ kiểm tra phiên mới nếu là tác vụ định kỳ (gửi cho tất cả)
+                            last_processed_phien = int(database.get_app_setting('last_processed_phien') or '0')
+                            if phien_number > last_processed_phien:
+                                is_new_phien = True
+                                logger.info(f"Phát hiện phiên mới: {phien_number}. Phiên cuối đã xử lý: {last_processed_phien}")
+                            else:
+                                logger.debug(f"Phiên {phien_number} đã được xử lý. Không có phiên mới để thông báo tự động.")
+                                return # Không có phiên mới, thoát khỏi hàm
+
+                        # Nếu là phiên mới (từ tác vụ định kỳ) HOẶC là lệnh /taixiu thủ công, thì cập nhật DB và AI
+                        if is_new_phien or target_chat_id is not None:
+                            database.add_result(phien_number, ket_qua_display, actual_result_char, tong, xuc_xac_1, xuc_xac_2, xuc_xac_3)
+                            # Cập nhật phiên cuối cùng đã xử lý nếu là tác vụ định kỳ
+                            if is_new_phien:
+                                database.update_app_setting('last_processed_phien', str(phien_number))
                         
-                        # 2. Lấy lịch sử 13 phiên gần nhất từ DB
+                        # Lấy dữ liệu để dự đoán và hiển thị (luôn làm, dù là phiên mới hay cũ)
                         history = database.get_latest_history()
-                        
-                        # 3. Lấy điểm hiện tại của các AI
                         ai_scores = database.get_ai_scores()
-                        
-                        # 4. Lấy trạng thái của AI2 (số lỗi liên tiếp)
                         ai2_consecutive_errors = database.get_ai_state('ai2_defensive')
 
-                        # 5. Gọi AI tổng hợp để đưa ra dự đoán cuối cùng
                         final_prediction_display, ai_individual_predictions = prediction_engine.ensemble_predict(
                             history, ai_scores, ai2_consecutive_errors
                         )
 
-                        # 6. Cập nhật điểm và trạng thái của các AI dựa trên kết quả thực tế
-                        prediction_engine.update_ai_scores_and_states(
-                            actual_result_char, # Kết quả thực tế ('T' hoặc 'X')
-                            ai_individual_predictions, # Dự đoán của từng AI
-                            ai_scores, # Điểm hiện tại của các AI
-                            ai2_consecutive_errors, # Số lỗi liên tiếp hiện tại của AI2
-                            database.update_ai_score, # Hàm để cập nhật điểm AI vào DB
-                            database.update_ai_state  # Hàm để cập nhật trạng thái AI2 vào DB
-                        )
+                        # Chỉ cập nhật điểm AI nếu đây là phiên MỚI được xử lý (tránh cập nhật nhiều lần)
+                        if is_new_phien:
+                            prediction_engine.update_ai_scores_and_states(
+                                actual_result_char, 
+                                ai_individual_predictions, 
+                                ai_scores, 
+                                ai2_consecutive_errors, 
+                                database.update_ai_score, 
+                                database.update_ai_state  
+                            )
+                        
+                        # Tạo tin nhắn
+                        message = f"""🎲 <b>Kết quả phiên mới nhất:</b>
+Phiên: <code>{phien_number}</code>
+Kết quả: <b><span style="color:{"#4CAF50" if actual_result_char == "T" else "#FF5722"};">{ket_qua_display}</span></b>
+Tổng: <b>{tong}</b> ({ket_qua_display})
+Xúc xắc: <code>{xuc_xac_1}</code>, <code>{xuc_xac_2}</code>, <code>{xuc_xac_3}</code>
 
-                        message = f"""🎲 Kết quả mới nhất:
-Phiên: {phien_number}
-Kết quả: {ket_qua_display}
-Tổng: {tong} ({ket_qua_display})
-Xúc xắc: {xuc_xac_1}, {xuc_xac_2}, {xuc_xac_3}
+✨ <b>Dự đoán phiên tiếp theo:</b> <b>{final_prediction_display}</b>
 
-💡 **Dự đoán phiên tiếp theo:** {final_prediction_display}
+<pre>
+--- Thống kê AI ---
+AI Trend: {ai_scores.get('ai1_trend', 0):.0f} điểm
+AI Defensive: {ai_scores.get('ai2_defensive', 0):.0f} điểm (Lỗi liên tiếp: {ai2_consecutive_errors})
+AI Pattern: {ai_scores.get('ai3_pattern', 0):.0f} điểm
+</pre>
 """
-                        # Thông tin thêm cho debug hoặc admin (có thể bỏ đi sau khi ổn định)
-                        current_ai_scores = database.get_ai_scores()
-                        current_ai2_state = database.get_ai_state('ai2_defensive')
-                        message += "\n--- Thông tin AI ---"
-                        for ai_name, score in current_ai_scores.items():
-                            message += f"\n- {ai_name.replace('_', ' ').title()}: {score:.0f} điểm"
-                        message += f"\n- AI2 lỗi liên tiếp: {current_ai2_state}"
+                        # Gửi tin nhắn
+                        if target_chat_id: # Gửi cho một chat cụ thể (lệnh /taixiu)
+                            await context.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='HTML')
+                        else: # Gửi cho tất cả người dùng hợp lệ (tác vụ định kỳ)
+                            for uid in list(user_data.keys()): # Lặp qua bản sao của keys để tránh lỗi thay đổi kích thước
+                                try:
+                                    user_info = user_data.get(uid)
+                                    if user_info and datetime.strptime(user_info["expiration_date"], "%Y-%m-%d").date() >= date.today():
+                                        await context.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
+                                        await asyncio.sleep(0.1) # Tránh bị flood
+                                    # else:
+                                    #     logger.debug(f"Không gửi thông báo tới user {uid} vì đã hết hạn hoặc không có dữ liệu.")
+                                except Exception as e:
+                                    logger.warning(f"Không thể gửi thông báo tự động tới người dùng {uid}: {e}")
+                            logger.info(f"Đã xử lý và thông báo phiên {phien_number} cho tất cả người dùng.")
 
                     else:
-                        message = f"❌ Dữ liệu kết quả từ API không hợp lệ: '{data.get('Ket_qua')}'"
-                        logger.warning(f"Invalid result from API: {data.get('Ket_qua')}")
+                        error_message = f"❌ Không thể lấy dữ liệu từ server Tài Xỉu. Vui lòng thử lại sau. (Status: {resp.status})"
+                        logger.warning(error_message)
+                        if target_chat_id: # Chỉ gửi lỗi cho người dùng nếu họ gọi lệnh thủ công
+                            await context.bot.send_message(chat_id=target_chat_id, text=error_message)
 
-                else:
-                    message = "❌ Không thể lấy dữ liệu từ server Tài Xỉu. Vui lòng thử lại sau."
-                    logger.warning(f"Lỗi API Tài Xỉu: Status {resp.status}")
         except aiohttp.ClientError as e:
-            message = f"❌ Lỗi kết nối đến server Tài Xỉu: {e!s}. Vui lòng kiểm tra kết nối mạng hoặc API."
-            logger.error(f"Lỗi kết nối API Tài Xỉu: {e}", exc_info=True)
+            error_message = f"❌ Lỗi kết nối đến server Tài Xỉu: {e!s}. Vui lòng kiểm tra kết nối mạng hoặc API."
+            logger.error(error_message, exc_info=True)
+            if target_chat_id:
+                await context.bot.send_message(chat_id=target_chat_id, text=error_message)
         except json.JSONDecodeError as e:
-            message = f"❌ Lỗi đọc dữ liệu từ server: Dữ liệu không phải JSON hợp lệ. Chi tiết: {e!s}"
-            logger.error(f"Lỗi JSON decode từ API Tài Xỉu: {e}", exc_info=True)
+            error_message = f"❌ Lỗi đọc dữ liệu từ server: Dữ liệu không phải JSON hợp lệ. Chi tiết: {e!s}"
+            logger.error(error_message, exc_info=True)
+            if target_chat_id:
+                await context.bot.send_message(chat_id=target_chat_id, text=error_message)
         except Exception as e:
-            message = f"❌ Lỗi không xác định đã xảy ra: {e!s}. Vui lòng liên hệ hỗ trợ."
-            logger.error(f"Lỗi chung khi lấy dữ liệu Tài Xỉu: {e}", exc_info=True) # exc_info để in stack trace
+            error_message = f"❌ Lỗi không xác định đã xảy ra: {e!s}. Vui lòng liên hệ hỗ trợ."
+            logger.error(error_message, exc_info=True)
+            if target_chat_id:
+                await context.bot.send_message(chat_id=target_chat_id, text=error_message)
 
-    await update.message.reply_text(message)
+# Lệnh Tài Xỉu (người dùng gọi thủ công)
+async def taixiu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await process_and_send_taixiu(context, target_chat_id=user_id)
+
+# Hàm gọi bởi JobQueue để kiểm tra phiên mới tự động
+async def check_for_new_phien(context: ContextTypes.DEFAULT_TYPE):
+    # Gọi hàm xử lý chung, không cung cấp target_chat_id để nó gửi cho tất cả người dùng
+    await process_and_send_taixiu(context)
 
 
 # --- Lệnh dành cho Admin/CTV ---
@@ -296,27 +336,18 @@ async def giahan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id = int(context.args[0])
     days_to_add = int(context.args[1])
 
+    # Nếu người dùng chưa có trong user_data (RAM), thêm mới với ngày hết hạn từ hôm nay
     if target_user_id not in user_data:
-        # Nếu người dùng chưa có trong user_data (RAM), thêm mới với ngày hết hạn từ hôm nay
-        new_expiration_date = date.today() + timedelta(days=days_to_add)
-        user_data[target_user_id] = {
-            "expiration_date": new_expiration_date.strftime("%Y-%m-%d"),
-            "xu": 0, # Mặc định 0 xu
-        }
-        await update.message.reply_text(
-            f"✅ Tạo mới người dùng ID {target_user_id} và gia hạn thành công {days_to_add} ngày. "
-            f"Ngày hết hạn mới: {new_expiration_date.strftime('%Y-%m-%d')}"
-        )
+        current_exp_date = date.today()
+        user_data[target_user_id] = {"xu": 0} # Mặc định 0 xu
+    else:
+        # Cập nhật ngày hết hạn cho người dùng hiện có
+        current_exp_str = user_data[target_user_id].get("expiration_date", date.today().strftime("%Y-%m-%d"))
         try:
-            await context.bot.send_message(chat_id=target_user_id, text=f"🎉 Tài khoản của bạn đã được gia hạn thêm {days_to_add} ngày. Ngày hết hạn mới: {new_expiration_date.strftime('%Y-%m-%d')}")
-        except Exception as e:
-            logger.warning(f"Không thể gửi thông báo gia hạn tới người dùng {target_user_id}: {e}")
-        return
-
-
-    # Cập nhật ngày hết hạn cho người dùng hiện có
-    current_exp_str = user_data[target_user_id].get("expiration_date", "1970-01-01")
-    current_exp_date = datetime.strptime(current_exp_str, "%Y-%m-%d").date()
+            current_exp_date = datetime.strptime(current_exp_str, "%Y-%m-%d").date()
+        except ValueError: # Xử lý trường hợp ngày không hợp lệ, mặc định từ hôm nay
+            current_exp_date = date.today()
+            logger.warning(f"Ngày hết hạn '{current_exp_str}' của user {target_user_id} không hợp lệ, đặt lại từ hôm nay.")
 
     new_expiration_date = current_exp_date + timedelta(days=days_to_add)
     user_data[target_user_id]["expiration_date"] = new_expiration_date.strftime("%Y-%m-%d")
@@ -404,6 +435,12 @@ def main():
     keep_alive() # Gọi hàm này để khởi động server keep-alive (cho Render)
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Lấy JobQueue từ ứng dụng
+    job_queue = app.job_queue
+
+    # Đăng ký tác vụ định kỳ: kiểm tra API mỗi 10 giây (điều chỉnh theo tần suất API cập nhật)
+    job_queue.run_repeating(check_for_new_phien, interval=10, first=0) # first=0 để chạy ngay khi bot khởi động
+
     # Đăng ký các lệnh
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -422,7 +459,7 @@ def main():
     app.add_handler(CommandHandler("xoactv", xoactv))
     app.add_handler(CommandHandler("tb", tb))
 
-    logger.info("Bot đang chạy... Đang lắng nghe các cập nhật.")
+    logger.info("Bot đang chạy... Đang lắng nghe các cập nhật và kiểm tra API tự động.")
     app.run_polling(poll_interval=1.0) # Lắng nghe update mỗi 1 giây
 
 if __name__ == '__main__':
