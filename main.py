@@ -20,32 +20,44 @@ import prediction_engine # Để sử dụng các AI dự đoán
 
 # Thiết lập logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
     level=logging.INFO # Đặt INFO để xem log quan trọng, DEBUG để xem tất cả
 )
 logger = logging.getLogger(__name__)
 
-# --- Cấu hình Bot (GÁN TRỰC TIẾP GIÁ TRỊ) ---
-# THAY THẾ 'YOUR_TELEGRAM_BOT_TOKEN' VÀ YOUR_ADMIN_ID BÊN DƯỚI BẰNG GIÁ TRỊ THỰC CỦA BẠN
-TELEGRAM_TOKEN = "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s" # <-- ĐIỀN TOKEN CỦA BẠN VÀO ĐÂY
-ADMIN_ID = 6915752059 # <-- ĐIỀN ID ADMIN CỦA BẠN VÀO ĐÂY (PHẢI LÀ SỐ NGUYÊN)
+# --- Cấu hình Bot (Hardcode - CẢNH BÁO: RỦI RO BẢO MẬT CAO!) ---
+# Đã gắn token bot Telegram của bạn vào đây:
+TELEGRAM_TOKEN = "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s" 
 
-# Bạn có thể bỏ qua kiểm tra này nếu chắc chắn đã gán đúng
-# if not TELEGRAM_TOKEN or not ADMIN_ID:
-#     logger.error("TELEGRAM_TOKEN hoặc ADMIN_ID chưa được đặt trong biến môi trường. Bot sẽ không hoạt động.")
-#     # Bạn có thể thoát hoặc sử dụng giá trị mặc định cho testing
-#     # sys.exit(1)
+# Đã gắn ID Telegram admin của bạn vào đây:
+ADMIN_ID = 6915752059 # Đây là số nguyên, không có dấu nháy kép
+
+# --------------------------------------------------------------------------------
+# CẢNH BÁO BẢO MẬT: Hardcode thông tin nhạy cảm (token, ID) vào code là 
+# KHÔNG ĐƯỢC KHUYẾN NGHỊ. Nếu code của bạn bị lộ, các thông tin này cũng sẽ bị lộ.
+# Phương pháp an toàn hơn là sử dụng Biến môi trường trên Render.
+# --------------------------------------------------------------------------------
+
+# Các kiểm tra đảm bảo giá trị hợp lệ sau khi hardcode
+if not isinstance(TELEGRAM_TOKEN, str) or not TELEGRAM_TOKEN:
+    logger.critical("TELEGRAM_TOKEN không hợp lệ hoặc bị thiếu. Bot không thể khởi động.")
+    exit(1)
+
+if not isinstance(ADMIN_ID, int) or ADMIN_ID <= 0:
+    logger.critical("ADMIN_ID không hợp lệ hoặc bị thiếu. Bot không thể khởi động.")
+    exit(1)
+
 
 HTTP_API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
 
 # Danh sách user_id của các cộng tác viên (CTV)
 # Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững.
-CTV_IDS = set()
+CTV_IDS = set() 
 
-# Dictionary để lưu trữ thông tin người dùng (ngày hết hạn, xu).
+# Dictionary để lưu trữ thông tin người dùng (ngày hết hạn, xu). 
 # Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững.
 # Format: {user_id: {"expiration_date": "YYYY-MM-DD", "xu": 0}}
-user_data = {}
+user_data = {} 
 
 
 # --- Hàm kiểm tra quyền ---
@@ -66,7 +78,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Người dùng mới đã tương tác: {user.id}")
 
     await update.message.reply_text(
-        f"Xin chào {user.full_name}! 🎲 Chào mừng đến với BOT SUNWIN TÀI XỈU DỰ ĐOÁN\n"
+        f"Xin chào {user.full_name!s}! 🎲 Chào mừng đến với BOT SUNWIN TÀI XỈU DỰ ĐOÁN\n"
         "Gõ /help để xem các lệnh có thể sử dụng."
     )
 
@@ -124,7 +136,7 @@ async def gopy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gopy_text = " ".join(context.args)
     user = update.effective_user
     message_to_admin = (
-        f"GÓP Ý MỚI từ @{user.username or user.full_name} (ID: {user.id}):\n\n"
+        f"GÓP Ý MỚI từ @{user.username or user.full_name!s} (ID: {user.id}):\n\n"
         f"Nội dung: {gopy_text}"
     )
 
@@ -166,13 +178,14 @@ async def taixiu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     data = await resp.json()
                     # Giải mã Unicode trong Ket_qua
                     ket_qua_decoded = data.get('Ket_qua', 'N/A').encode('latin1').decode('unicode_escape')
-
-                    phien_number = data.get('Phien')
-                    tong = data.get('Tong')
-                    xuc_xac_1 = data.get('Xuc_xac_1')
-                    xuc_xac_2 = data.get('Xuc_xac_2')
-                    xuc_xac_3 = data.get('Xuc_xac_3') # Đảm bảo lấy giá trị này
-
+                    
+                    # Lấy dữ liệu từ JSON, cung cấp giá trị mặc định là 0 nếu không tìm thấy hoặc là None
+                    phien_number = data.get('Phien', 0) 
+                    tong = data.get('Tong', 0)
+                    xuc_xac_1 = data.get('Xuc_xac_1', 0)
+                    xuc_xac_2 = data.get('Xuc_xac_2', 0)
+                    xuc_xac_3 = data.get('Xuc_xac_3', 0) # Đã có giá trị mặc định
+                    
                     # Chuẩn hóa kết quả về 'T' hoặc 'X' để lưu DB và phân tích AI
                     actual_result_char = None
                     if ket_qua_decoded == 'Tài':
@@ -184,13 +197,13 @@ async def taixiu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         # 1. Lưu kết quả mới nhất vào DB
                         # ketqua là chuỗi nguyên văn 'Tài'/'Xỉu', ketqua_char là 'T'/'X'
                         database.add_result(phien_number, ket_qua_decoded, actual_result_char, tong, xuc_xac_1, xuc_xac_2, xuc_xac_3)
-
+                        
                         # 2. Lấy lịch sử 13 phiên gần nhất từ DB
                         history = database.get_latest_history()
-
+                        
                         # 3. Lấy điểm hiện tại của các AI
                         ai_scores = database.get_ai_scores()
-
+                        
                         # 4. Lấy trạng thái của AI2 (số lỗi liên tiếp)
                         ai2_consecutive_errors = database.get_ai_state('ai2_defensive')
 
@@ -233,13 +246,13 @@ Xúc xắc: {xuc_xac_1}, {xuc_xac_2}, {xuc_xac_3}
                     message = "❌ Không thể lấy dữ liệu từ server Tài Xỉu. Vui lòng thử lại sau."
                     logger.warning(f"Lỗi API Tài Xỉu: Status {resp.status}")
         except aiohttp.ClientError as e:
-            message = f"❌ Lỗi kết nối đến server Tài Xỉu: {e}. Vui lòng kiểm tra kết nối mạng hoặc API."
-            logger.error(f"Lỗi kết nối API Tài Xỉu: {e}")
+            message = f"❌ Lỗi kết nối đến server Tài Xỉu: {e!s}. Vui lòng kiểm tra kết nối mạng hoặc API."
+            logger.error(f"Lỗi kết nối API Tài Xỉu: {e}", exc_info=True)
         except json.JSONDecodeError as e:
-            message = f"❌ Lỗi đọc dữ liệu từ server: Dữ liệu không phải JSON hợp lệ. Chi tiết: {e}"
-            logger.error(f"Lỗi JSON decode từ API Tài Xỉu: {e}")
+            message = f"❌ Lỗi đọc dữ liệu từ server: Dữ liệu không phải JSON hợp lệ. Chi tiết: {e!s}"
+            logger.error(f"Lỗi JSON decode từ API Tài Xỉu: {e}", exc_info=True)
         except Exception as e:
-            message = f"❌ Lỗi không xác định đã xảy ra: {e}. Vui lòng liên hệ hỗ trợ."
+            message = f"❌ Lỗi không xác định đã xảy ra: {e!s}. Vui lòng liên hệ hỗ trợ."
             logger.error(f"Lỗi chung khi lấy dữ liệu Tài Xỉu: {e}", exc_info=True) # exc_info để in stack trace
 
     await update.message.reply_text(message)
@@ -365,7 +378,7 @@ async def tb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     broadcast_message = " ".join(context.args)
-
+    
     sent_count = 0
     failed_count = 0
     # Lặp qua một bản sao của user_data.keys() để tránh lỗi thay đổi kích thước khi gửi
@@ -377,7 +390,7 @@ async def tb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Không thể gửi thông báo tới người dùng {uid}: {e}")
             failed_count += 1
-
+    
     await update.message.reply_text(f"✅ Đã gửi thông báo tới {sent_count} người dùng. Thất bại: {failed_count}.")
 
 
@@ -385,11 +398,9 @@ async def tb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     database.init_db() # Khởi tạo cơ sở dữ liệu khi bot chạy
     prediction_engine.load_patterns() # Tải các mẫu từ dudoan.txt khi bot chạy
-
-    # Bỏ qua kiểm tra biến môi trường vì đã gán trực tiếp
-    # if not TELEGRAM_TOKEN or not ADMIN_ID:
-    #     logger.critical("Bot không thể khởi động do thiếu TELEGRAM_TOKEN hoặc ADMIN_ID trong biến môi trường.")
-    #     return # Thoát nếu thiếu cấu hình
+    
+    # Các kiểm tra TELEGRAM_TOKEN và ADMIN_ID đã hardcode được thực hiện ở đầu file
+    # Nếu có lỗi, chương trình sẽ thoát sớm
 
     keep_alive() # Gọi hàm này để khởi động server keep-alive (cho Render)
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -417,3 +428,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
