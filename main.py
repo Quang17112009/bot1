@@ -1,3 +1,4 @@
+import os
 import asyncio
 import aiohttp
 from telegram import Update
@@ -12,29 +13,37 @@ import json
 import logging
 from datetime import date, datetime, timedelta
 
-# Import các module mới
+# Import các module tùy chỉnh
 from keep_alive import keep_alive
 import database # Để tương tác với SQLite
 import prediction_engine # Để sử dụng các AI dự đoán
 
 # Thiết lập logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO # Đặt INFO để xem log quan trọng, DEBUG để xem tất cả
 )
 logger = logging.getLogger(__name__)
 
-# --- Cấu hình Bot ---
-TELEGRAM_TOKEN = "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s" # Token của bạn đã được cập nhật
+# --- Cấu hình Bot (GÁN TRỰC TIẾP GIÁ TRỊ) ---
+# THAY THẾ 'YOUR_TELEGRAM_BOT_TOKEN' VÀ YOUR_ADMIN_ID BÊN DƯỚI BẰNG GIÁ TRỊ THỰC CỦA BẠN
+TELEGRAM_TOKEN = "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s" # <-- ĐIỀN TOKEN CỦA BẠN VÀO ĐÂY
+ADMIN_ID = 6915752059 # <-- ĐIỀN ID ADMIN CỦA BẠN VÀO ĐÂY (PHẢI LÀ SỐ NGUYÊN)
+
+# Bạn có thể bỏ qua kiểm tra này nếu chắc chắn đã gán đúng
+# if not TELEGRAM_TOKEN or not ADMIN_ID:
+#     logger.error("TELEGRAM_TOKEN hoặc ADMIN_ID chưa được đặt trong biến môi trường. Bot sẽ không hoạt động.")
+#     # Bạn có thể thoát hoặc sử dụng giá trị mặc định cho testing
+#     # sys.exit(1)
+
 HTTP_API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
 
-# Thay thế bằng Telegram User ID của Admin chính (là bạn)
-ADMIN_ID = 6915752059 # ID Admin của bạn đã được cập nhật
-
 # Danh sách user_id của các cộng tác viên (CTV)
-# Vẫn nên lưu trong DB hoặc file riêng nếu muốn persistent
-CTV_IDS = set() 
+# Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững.
+CTV_IDS = set()
 
-# Dictionary để lưu trữ thông tin người dùng (cho mục đích demo, VẪN NÊN DÙNG DATABASE THỰC TẾ)
+# Dictionary để lưu trữ thông tin người dùng (ngày hết hạn, xu).
+# Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững.
 # Format: {user_id: {"expiration_date": "YYYY-MM-DD", "xu": 0}}
 user_data = {}
 
@@ -52,6 +61,7 @@ def is_ctv_or_admin(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in user_data:
+        # Mặc định thêm người dùng mới với 0 xu và ngày hết hạn hôm nay
         user_data[user.id] = {"expiration_date": date.today().strftime("%Y-%m-%d"), "xu": 0}
         logger.info(f"Người dùng mới đã tương tác: {user.id}")
 
@@ -136,7 +146,7 @@ async def nap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - Số tài khoản: 0939766383
     - Tên chủ TK: Nguyen Huynh Nhut Quang
 
-    NỘI DUNG CHUYỂN KHOẢN (QUAN TRỌNG):
+    ❗️ Nội dung chuyển khoản (QUAN TRỌNG):
     mua luot {{user_id}}
 
     ❗️ Nội dung bắt buộc của bạn là:
@@ -154,43 +164,49 @@ async def taixiu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.get(HTTP_API_URL) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    # Giải mã Unicode trong Ket_qua
                     ket_qua_decoded = data.get('Ket_qua', 'N/A').encode('latin1').decode('unicode_escape')
-                    
+
                     phien_number = data.get('Phien')
                     tong = data.get('Tong')
                     xuc_xac_1 = data.get('Xuc_xac_1')
                     xuc_xac_2 = data.get('Xuc_xac_2')
-                    xuc_xac_3 = data.get('Xuc_xac_3')
+                    xuc_xac_3 = data.get('Xuc_xac_3') # Đảm bảo lấy giá trị này
 
-                    # Chuẩn hóa kết quả về 'T' hoặc 'X' để lưu DB và phân tích
-                    actual_result_char = 'T' if ket_qua_decoded == 'Tài' else 'X' if ket_qua_decoded == 'Xỉu' else None
+                    # Chuẩn hóa kết quả về 'T' hoặc 'X' để lưu DB và phân tích AI
+                    actual_result_char = None
+                    if ket_qua_decoded == 'Tài':
+                        actual_result_char = 'T'
+                    elif ket_qua_decoded == 'Xỉu':
+                        actual_result_char = 'X'
 
                     if actual_result_char:
                         # 1. Lưu kết quả mới nhất vào DB
-                        database.add_result(phien_number, ket_qua_decoded, tong, xuc_xac_1, xuc_xac_2, xuc_xac_3)
-                        
+                        # ketqua là chuỗi nguyên văn 'Tài'/'Xỉu', ketqua_char là 'T'/'X'
+                        database.add_result(phien_number, ket_qua_decoded, actual_result_char, tong, xuc_xac_1, xuc_xac_2, xuc_xac_3)
+
                         # 2. Lấy lịch sử 13 phiên gần nhất từ DB
                         history = database.get_latest_history()
-                        
+
                         # 3. Lấy điểm hiện tại của các AI
                         ai_scores = database.get_ai_scores()
-                        
+
                         # 4. Lấy trạng thái của AI2 (số lỗi liên tiếp)
                         ai2_consecutive_errors = database.get_ai_state('ai2_defensive')
 
                         # 5. Gọi AI tổng hợp để đưa ra dự đoán cuối cùng
-                        final_prediction, ai_individual_predictions = prediction_engine.ensemble_predict(
+                        final_prediction_display, ai_individual_predictions = prediction_engine.ensemble_predict(
                             history, ai_scores, ai2_consecutive_errors
                         )
 
                         # 6. Cập nhật điểm và trạng thái của các AI dựa trên kết quả thực tế
                         prediction_engine.update_ai_scores_and_states(
-                            actual_result_char,
-                            ai_individual_predictions,
-                            ai_scores,
-                            ai2_consecutive_errors,
-                            database.update_ai_score, # Pass function to update score in DB
-                            database.update_ai_state  # Pass function to update state in DB
+                            actual_result_char, # Kết quả thực tế ('T' hoặc 'X')
+                            ai_individual_predictions, # Dự đoán của từng AI
+                            ai_scores, # Điểm hiện tại của các AI
+                            ai2_consecutive_errors, # Số lỗi liên tiếp hiện tại của AI2
+                            database.update_ai_score, # Hàm để cập nhật điểm AI vào DB
+                            database.update_ai_state  # Hàm để cập nhật trạng thái AI2 vào DB
                         )
 
                         message = f"""🎲 Kết quả mới nhất:
@@ -199,30 +215,31 @@ Kết quả: {ket_qua_decoded}
 Tổng: {tong} ({ket_qua_decoded})
 Xúc xắc: {xuc_xac_1}, {xuc_xac_2}, {xuc_xac_3}
 
-💡 **Dự đoán phiên tiếp theo:** {final_prediction}
+💡 **Dự đoán phiên tiếp theo:** {final_prediction_display}
 """
-                        # Thông tin thêm cho debug hoặc admin (có thể bỏ đi)
+                        # Thông tin thêm cho debug hoặc admin (có thể bỏ đi sau khi ổn định)
                         current_ai_scores = database.get_ai_scores()
                         current_ai2_state = database.get_ai_state('ai2_defensive')
-                        message += "\n(Điểm AI: "
+                        message += "\n--- Thông tin AI ---"
                         for ai_name, score in current_ai_scores.items():
-                            message += f"{ai_name[:3]}: {score:.0f} "
-                        message += f"| Lỗi AI2: {current_ai2_state})"
+                            message += f"\n- {ai_name.replace('_', ' ').title()}: {score:.0f} điểm"
+                        message += f"\n- AI2 lỗi liên tiếp: {current_ai2_state}"
 
                     else:
-                        message = f"❌ Dữ liệu kết quả không hợp lệ: {data.get('Ket_qua')}"
+                        message = f"❌ Dữ liệu kết quả từ API không hợp lệ: '{data.get('Ket_qua')}'"
+                        logger.warning(f"Invalid result from API: {data.get('Ket_qua')}")
 
                 else:
                     message = "❌ Không thể lấy dữ liệu từ server Tài Xỉu. Vui lòng thử lại sau."
                     logger.warning(f"Lỗi API Tài Xỉu: Status {resp.status}")
         except aiohttp.ClientError as e:
-            message = f"❌ Lỗi kết nối đến server Tài Xỉu: {e}"
+            message = f"❌ Lỗi kết nối đến server Tài Xỉu: {e}. Vui lòng kiểm tra kết nối mạng hoặc API."
             logger.error(f"Lỗi kết nối API Tài Xỉu: {e}")
         except json.JSONDecodeError as e:
-            message = f"❌ Lỗi đọc dữ liệu từ server: {e}"
+            message = f"❌ Lỗi đọc dữ liệu từ server: Dữ liệu không phải JSON hợp lệ. Chi tiết: {e}"
             logger.error(f"Lỗi JSON decode từ API Tài Xỉu: {e}")
         except Exception as e:
-            message = f"❌ Lỗi không xác định: {e}"
+            message = f"❌ Lỗi không xác định đã xảy ra: {e}. Vui lòng liên hệ hỗ trợ."
             logger.error(f"Lỗi chung khi lấy dữ liệu Tài Xỉu: {e}", exc_info=True) # exc_info để in stack trace
 
     await update.message.reply_text(message)
@@ -235,7 +252,7 @@ async def full(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Bạn không có quyền sử dụng lệnh này.")
         return
 
-    target_user_id = user_id
+    target_user_id = user_id # Mặc định là xem thông tin của chính người dùng
     if context.args and context.args[0].isdigit():
         target_user_id = int(context.args[0])
 
@@ -248,7 +265,7 @@ async def full(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Là CTV: {'Có' if target_user_id in CTV_IDS else 'Không'}"
         )
     else:
-        message = f"Không tìm thấy thông tin cho người dùng ID: {target_user_id}."
+        message = f"Không tìm thấy thông tin cho người dùng ID: {target_user_id}. (Chỉ lưu trong RAM nếu người dùng chưa tương tác)"
     await update.message.reply_text(message)
 
 
@@ -267,13 +284,12 @@ async def giahan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_user_id = int(context.args[0])
     days_to_add = int(context.args[1])
 
-    from datetime import date, datetime, timedelta
-
     if target_user_id not in user_data:
+        # Nếu người dùng chưa có trong user_data (RAM), thêm mới với ngày hết hạn từ hôm nay
         new_expiration_date = date.today() + timedelta(days=days_to_add)
         user_data[target_user_id] = {
             "expiration_date": new_expiration_date.strftime("%Y-%m-%d"),
-            "xu": 0, 
+            "xu": 0, # Mặc định 0 xu
         }
         await update.message.reply_text(
             f"✅ Tạo mới người dùng ID {target_user_id} và gia hạn thành công {days_to_add} ngày. "
@@ -286,6 +302,7 @@ async def giahan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+    # Cập nhật ngày hết hạn cho người dùng hiện có
     current_exp_str = user_data[target_user_id].get("expiration_date", "1970-01-01")
     current_exp_date = datetime.strptime(current_exp_str, "%Y-%m-%d").date()
 
@@ -296,6 +313,7 @@ async def giahan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Gia hạn thành công cho người dùng ID {target_user_id} thêm {days_to_add} ngày. "
         f"Ngày hết hạn mới: {new_expiration_date.strftime('%Y-%m-%d')}"
     )
+    # Cố gắng thông báo cho người dùng được gia hạn
     try:
         await context.bot.send_message(chat_id=target_user_id, text=f"🎉 Tài khoản của bạn đã được gia hạn thêm {days_to_add} ngày. Ngày hết hạn mới: {new_expiration_date.strftime('%Y-%m-%d')}")
     except Exception as e:
@@ -347,18 +365,19 @@ async def tb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     broadcast_message = " ".join(context.args)
-    
+
     sent_count = 0
     failed_count = 0
+    # Lặp qua một bản sao của user_data.keys() để tránh lỗi thay đổi kích thước khi gửi
     for uid in list(user_data.keys()):
         try:
             await context.bot.send_message(chat_id=uid, text=f"📢 THÔNG BÁO TỪ ADMIN:\n\n{broadcast_message}")
             sent_count += 1
-            await asyncio.sleep(0.05) 
+            await asyncio.sleep(0.05) # Tránh bị flood limit của Telegram
         except Exception as e:
             logger.warning(f"Không thể gửi thông báo tới người dùng {uid}: {e}")
             failed_count += 1
-    
+
     await update.message.reply_text(f"✅ Đã gửi thông báo tới {sent_count} người dùng. Thất bại: {failed_count}.")
 
 
@@ -366,11 +385,16 @@ async def tb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     database.init_db() # Khởi tạo cơ sở dữ liệu khi bot chạy
     prediction_engine.load_patterns() # Tải các mẫu từ dudoan.txt khi bot chạy
-    
-    keep_alive() # Gọi hàm này để khởi động server keep-alive
+
+    # Bỏ qua kiểm tra biến môi trường vì đã gán trực tiếp
+    # if not TELEGRAM_TOKEN or not ADMIN_ID:
+    #     logger.critical("Bot không thể khởi động do thiếu TELEGRAM_TOKEN hoặc ADMIN_ID trong biến môi trường.")
+    #     return # Thoát nếu thiếu cấu hình
+
+    keep_alive() # Gọi hàm này để khởi động server keep-alive (cho Render)
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Thêm các lệnh
+    # Đăng ký các lệnh
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("support", support))
@@ -388,9 +412,8 @@ def main():
     app.add_handler(CommandHandler("xoactv", xoactv))
     app.add_handler(CommandHandler("tb", tb))
 
-    logger.info("Bot đang chạy...")
-    app.run_polling(poll_interval=1.0) 
+    logger.info("Bot đang chạy... Đang lắng nghe các cập nhật.")
+    app.run_polling(poll_interval=1.0) # Lắng nghe update mỗi 1 giây
 
 if __name__ == '__main__':
     main()
-
