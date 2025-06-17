@@ -1,466 +1,553 @@
 import os
-import asyncio
-import aiohttp
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+import telebot
+from datetime import datetime, timedelta
 import json
-import logging
-from datetime import date, datetime, timedelta
+import math
+import time
+import requests
+import threading # Dùng để chạy vòng lặp dự đoán trong luồng riêng
 
-# Import các module tùy chỉnh
-from keep_alive import keep_alive
-import database # Để tương tác với SQLite
-import prediction_engine # Để sử dụng các AI dự đoán
+# --- Cấu hình Bot và API ---
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s")
+ADMIN_ID = 6915752059 # ID của bạn
+API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
+USER_DATA_FILE = "user_data.json"
+CTV_DATA_FILE = "ctv_data.json"
 
-# Thiết lập logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
-    level=logging.INFO # Đặt INFO để xem log quan trọng, DEBUG để xem tất cả
-)
-logger = logging.getLogger(__name__)
+bot = telebot.TeleBot(TOKEN)
 
-# --- Cấu hình Bot (Sử dụng biến môi trường - KHUYẾN NGHỊ BẢO MẬT) ---
-# Lấy token bot Telegram từ biến môi trường
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") 
-# Lấy ID Telegram admin từ biến môi trường
-ADMIN_ID_STR = os.getenv("ADMIN_ID") # Lấy dưới dạng chuỗi
-ADMIN_ID = None
-try:
-    if ADMIN_ID_STR:
-        ADMIN_ID = int(ADMIN_ID_STR)
-except ValueError:
-    logger.critical("ADMIN_ID trong biến môi trường không phải là số nguyên hợp lệ.")
+# --- Biến toàn cục để lưu trạng thái bot ---
+last_known_session = 0
+history_data = [] # Lưu trữ dữ liệu lịch sử từ API (3 xí ngầu)
+cau_history = [] # Lưu trữ lịch sử 'T' hoặc 'X' để check cầu (tối đa 5 phiên)
+last_prediction_message_id = {} # Lưu ID tin nhắn dự đoán để cập nhật/xóa nếu cần
 
-# Các kiểm tra đảm bảo giá trị hợp lệ
-if not isinstance(TELEGRAM_TOKEN, str) or not TELEGRAM_TOKEN:
-    logger.critical("TELEGRAM_TOKEN không hợp lệ hoặc bị thiếu. Bot không thể khởi động.")
-    exit(1)
+# --- Hàm hỗ trợ ---
+def clear_screen():
+    # Không cần dùng trong bot Telegram, nhưng giữ lại từ code 1 nếu muốn dùng cục bộ
+    os.system("cls" if os.name == "nt" else "clear")
 
-if not isinstance(ADMIN_ID, int) or ADMIN_ID <= 0:
-    logger.critical("ADMIN_ID không hợp lệ hoặc bị thiếu. Bot không thể khởi động.")
-    exit(1)
+def load_user_data():
+    if os.path.exists(USER_DATA_FILE):
+        with open(USER_DATA_FILE, 'r') as f:
+            return json.load(f)
+    return {}
 
+def save_user_data(data):
+    with open(USER_DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
 
-HTTP_API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
+def load_ctv_data():
+    if os.path.exists(CTV_DATA_FILE):
+        with open(CTV_DATA_FILE, 'r') as f:
+            return json.load(f)
+    return []
 
-# Danh sách user_id của các cộng tác viên (CTV)
-# Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững hơn thì cần lưu vào SQLite
-CTV_IDS = set() 
+def save_ctv_data(data):
+    with open(CTV_DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
 
-# Dictionary để lưu trữ thông tin người dùng (ngày hết hạn, xu). 
-# Để đơn giản, vẫn lưu trong bộ nhớ. Dùng DB nếu muốn bền vững hơn thì cần lưu vào SQLite
-# Format: {user_id: {"expiration_date": "YYYY-MM-DD", "xu": 0}}
-user_data = {} 
+user_data = load_user_data()
+ctv_list = load_ctv_data()
 
-
-# --- Hàm kiểm tra quyền ---
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
+def is_ctv(user_id):
+    return user_id in ctv_list or is_admin(user_id)
 
-def is_ctv_or_admin(user_id):
-    return user_id == ADMIN_ID or user_id in CTV_IDS
+def check_subscription(user_id):
+    user_id_str = str(user_id)
+    if user_id_str not in user_data:
+        return False, "Bạn chưa đăng ký sử dụng bot. Vui lòng dùng lệnh /nap để nạp tiền."
+    
+    expiry_date_str = user_data[user_id_str].get('expiry_date')
+    if not expiry_date_str:
+        return False, "Tài khoản của bạn không có ngày hết hạn. Vui lòng liên hệ Admin."
 
+    expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d %H:%M:%S')
+    if datetime.now() > expiry_date:
+        return False, f"Tài khoản của bạn đã hết hạn vào ngày {expiry_date_str}. Vui lòng gia hạn để tiếp tục sử dụng."
+    
+    return True, "Bạn đang có quyền truy cập."
 
-# --- Các lệnh cơ bản ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in user_data:
-        # Mặc định thêm người dùng mới với 0 xu và ngày hết hạn hôm nay
-        user_data[user.id] = {"expiration_date": date.today().strftime("%Y-%m-%d"), "xu": 0}
-        logger.info(f"Người dùng mới đã tương tác: {user.id}")
+# --- Thuật toán dự đoán từ Code 1 ---
+def du_doan_theo_xi_ngau(dice_list):
+    if not dice_list:
+        return "Đợi thêm dữ liệu"
+    
+    # Lấy 3 xí ngầu cuối cùng
+    d1, d2, d3 = dice_list[-1]
+    total = d1 + d2 + d3
 
-    await update.message.reply_text(
-        f"Xin chào {user.full_name!s}! 🎲 Chào mừng đến với BOT SUNWIN TÀI XỈU DỰ ĐOÁN\n"
-        "Gõ /help để xem các lệnh có thể sử dụng."
-    )
+    result_list = []
+    for d in [d1, d2, d3]:
+        tmp = d + total
+        # Điều chỉnh lại logic nếu tmp < 4 hoặc tmp >= 6
+        while tmp in [4, 5]: # Nếu là 4 hoặc 5, trừ 4
+            tmp -= 4
+        while tmp >= 6: # Nếu >= 6, trừ 6
+            tmp -= 6
+            
+        result_list.append("Tài" if tmp % 2 == 0 else "Xỉu")
 
+    # Đếm số lần xuất hiện của "Tài" và "Xỉu"
+    count_tai = result_list.count("Tài")
+    count_xiu = result_list.count("Xỉu")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = """
-👋 Các lệnh có sẵn:
-/start - Bắt đầu và nhận thông báo chào mừng.
-/help - Hiển thị danh sách các lệnh.
-/support - Liên hệ hỗ trợ.
-/gia - Xem bảng giá dịch vụ.
-/gopy <nội dung> - Gửi góp ý tới Admin.
-/nap - Hướng dẫn nạp tiền mua lượt.
-/taixiu - Xem kết quả Tài Xỉu mới nhất và dự đoán.
-
-🔑 Lệnh dành cho Admin/CTV:
-/full - Xem chi tiết thông tin người dùng (Admin/CTV).
-/giahan <id> <ngày> - Gia hạn cho người dùng (Admin/CTV).
-
-👑 Lệnh dành cho Admin chính:
-/ctv <id> - Thêm CTV.
-/xoactv <id> - Xóa CTV.
-/tb <nội dung> - Gửi thông báo tới tất cả người dùng.
-    """
-    await update.message.reply_text(help_text)
-
-
-async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Nếu bạn cần hỗ trợ, vui lòng liên hệ:\n"
-        "Telegram: @heheviptool\n"
-        "Gmail: nhutquangdzs1@gmail.com"
-    )
-
-
-async def gia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        """
-        BOT SUNWIN XIN THÔNG BÁO BẢNG GIÁ SUN BOT
-        20k 1 Ngày
-        50k 1 Tuần
-        80k 2 Tuần
-        130k 1 Tháng
-        BOT SUN TỈ Lệ 85-92%
-        ĐỌC 24/24 Vui Lòng ib @heheviptool Để Gia Hạn
-        """
-    )
+    if count_tai > count_xiu:
+        return "Tài"
+    elif count_xiu > count_tai:
+        return "Xỉu"
+    else:
+        # Nếu bằng nhau, ưu tiên dựa vào kết quả xí ngầu cuối cùng trong danh sách
+        return "Tài" if (d1 + d2 + d3) % 2 == 0 else "Xỉu"
 
 
-async def gopy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Vui lòng nhập nội dung góp ý. Ví dụ: /gopy Bot rất hay!")
-        return
+def is_cau_xau(cau_str):
+    mau_cau_xau = [
+        "TXXTX", "TXTXT", "XXTXX", "XTXTX", "TTXTX",
+        "XTTXT", "TXXTT", "TXTTX", "XXTTX", "XTXTT",
+        "TXTXX", "XXTXT", "TTXXT", "TXTTT", "XTXTX", # "XTXTX" trùng lặp
+        "XTXXT", "XTTTX", "TTXTT", "XTXTT", "TXXTX"  # "XTXTT" và "TXXTX" trùng lặp
+    ]
+    # Loại bỏ trùng lặp và chuyển về set để tìm kiếm nhanh hơn
+    mau_cau_xau_set = set(mau_cau_xau)
+    return cau_str in mau_cau_xau_set
 
-    gopy_text = " ".join(context.args)
-    user = update.effective_user
-    message_to_admin = (
-        f"GÓP Ý MỚI từ @{user.username or user.full_name!s} (ID: {user.id}):\n\n"
-        f"Nội dung: {gopy_text}"
-    )
+def is_cau_dep(cau_str):
+    mau_cau_dep = [
+        "TTTTT", "XXXXX", "TTTXX", "XXTTT", "TXTXX",
+        "TTTXT", "XTTTX", "TXXXT", "XXTXX", "TXTTT",
+        "XTTTT", "TTXTX", "TXXTX", "TXTXT", "XTXTX", # "TXTXT" và "XTXTX" trùng lặp
+        "TTTXT", "XTTXT", "TXTXT", "XXTXX", "TXXXX" # "TXTXT" và "XXTXX" trùng lặp
+    ]
+    # Loại bỏ trùng lặp và chuyển về set để tìm kiếm nhanh hơn
+    mau_cau_dep_set = set(mau_cau_dep)
+    return cau_str in mau_cau_dep_set
 
+# --- Lấy dữ liệu từ API ---
+def get_latest_data_from_api():
     try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=message_to_admin)
-        await update.message.reply_text("✅ Cảm ơn bạn đã gửi góp ý! Admin đã nhận được.")
-    except Exception as e:
-        logger.error(f"Lỗi khi gửi góp ý đến admin: {e}")
-        await update.message.reply_text("❌ Có lỗi xảy ra khi gửi góp ý. Vui lòng thử lại sau.")
+        response = requests.get(API_URL)
+        response.raise_for_status()  # Nâng lỗi cho mã trạng thái HTTP xấu (4xx hoặc 5xx)
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Lỗi khi lấy dữ liệu từ API: {e}")
+        return None
 
+# --- Logic chính của Bot (Vòng lặp dự đoán) ---
+def prediction_loop():
+    global last_known_session, history_data, cau_history, last_prediction_message_id
 
-async def nap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    nap_text = f"""
-    ⚜️ NẠP TIỀN MUA LƯỢT ⚜️
-
-    Để mua lượt, vui lòng chuyển khoản đến:
-    - Ngân hàng: MB BANK
-    - Số tài khoản: 0939766383
-    - Tên chủ TK: Nguyen Huynh Nhut Quang
-
-    ❗️ Nội dung chuyển khoản (QUAN TRỌNG):
-    mua luot {{user_id}}
-
-    ❗️ Nội dung bắt buộc của bạn là:
-    mua luot {user_id}
-
-    (Vui lòng sao chép đúng nội dung trên để được cộng lượt tự động)
-    Sau khi chuyển khoản, vui lòng chờ 1-2 phút và kiểm tra bằng lệnh /luot. Nếu có sự cố, hãy dùng lệnh /support.
-    """
-    await update.message.reply_text(nap_text)
-
-# --- Hàm chung để xử lý và gửi thông báo Tài Xỉu ---
-# Hàm này sẽ được gọi bởi tác vụ định kỳ và lệnh /taixiu
-async def process_and_send_taixiu(context: ContextTypes.DEFAULT_TYPE, target_chat_id: int = None):
-    """
-    Lấy dữ liệu API, xử lý, cập nhật DB và gửi thông báo.
-    Nếu target_chat_id được cung cấp, chỉ gửi tới chat đó (dùng cho lệnh /taixiu).
-    Nếu target_chat_id là None, gửi tới tất cả người dùng hợp lệ (dùng cho tác vụ định kỳ).
-    """
-    async with aiohttp.ClientSession() as session:
+    while True:
         try:
-            async with session.get(HTTP_API_URL) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    ket_qua_display = data.get('Ket_qua', 'N/A')
-                    phien_number = data.get('Phien', 0) 
-                    tong = data.get('Tong', 0)
-                    xuc_xac_1 = data.get('Xuc_xac_1', 0)
-                    xuc_xac_2 = data.get('Xuc_xac_2', 0)
-                    xuc_xac_3 = data.get('Xuc_xac_3', 0) 
+            data = get_latest_data_from_api()
+            if data:
+                current_session = data.get("Phien")
+                current_result_text = data.get("Ket_qua")
+                xuc_xac_1 = data.get("Xuc_xac_1")
+                xuc_xac_2 = data.get("Xuc_xac_2")
+                xuc_xac_3 = data.get("Xuc_xac_3")
+                total_dice = data.get("Tong")
 
-                    actual_result_char = None
-                    if ket_qua_display == 'Tài':
-                        actual_result_char = 'T'
-                    elif ket_qua_display == 'Xỉu':
-                        actual_result_char = 'X'
+                # Chuyển đổi "Tài" / "Xỉu" sang 'T' / 'X'
+                current_result_char = 'T' if current_result_text == 'Tài' else 'X'
 
-                    if actual_result_char:
-                        is_new_phien = False
-                        if target_chat_id is None: # Chỉ kiểm tra phiên mới nếu là tác vụ định kỳ (gửi cho tất cả)
-                            last_processed_phien = int(database.get_app_setting('last_processed_phien') or '0')
-                            if phien_number > last_processed_phien:
-                                is_new_phien = True
-                                logger.info(f"Phát hiện phiên mới: {phien_number}. Phiên cuối đã xử lý: {last_processed_phien}")
+                if current_session != last_known_session:
+                    print(f"Phát hiện phiên mới: {current_session}")
+                    last_known_session = current_session
+
+                    # Cập nhật lịch sử xí ngầu và lịch sử cầu
+                    if len(history_data) > 0 and history_data[-1][3] != current_session -1:
+                        # Nếu có phiên bị mất, xóa lịch sử để tránh dự đoán sai
+                        print("Phát hiện mất phiên, reset lịch sử dự đoán.")
+                        history_data = []
+                        cau_history = []
+                    
+                    if xuc_xac_1 and xuc_xac_2 and xuc_xac_3:
+                        history_data.append((xuc_xac_1, xuc_xac_2, xuc_xac_3, current_session))
+                        
+                        # Giới hạn lịch sử chỉ 5 phiên gần nhất cho mục đích dự đoán cầu
+                        if len(history_data) > 5:
+                            history_data.pop(0) # Loại bỏ phiên cũ nhất
+
+                        # Cập nhật lịch sử cầu
+                        if len(cau_history) > 0 and (cau_history[-1][1] != current_session -1):
+                            print("Phát hiện mất phiên trong lịch sử cầu, reset lịch sử cầu.")
+                            cau_history = []
+
+                        cau_history.append((current_result_char, current_session))
+                        if len(cau_history) > 5:
+                            cau_history.pop(0) # Loại bỏ kết quả cũ nhất
+                        
+                        current_cau_str = "".join([item[0] for item in cau_history])
+                        
+                        print(f"Lịch sử xí ngầu ({len(history_data)}): {history_data}")
+                        print(f"Lịch sử cầu ({len(cau_history)}): {current_cau_str}")
+                        print(f"Kết quả phiên {current_session}: {current_result_text} (Tổng: {total_dice} - Xí ngầu: {xuc_xac_1}, {xuc_xac_2}, {xuc_xac_3})")
+
+                        # Chỉ dự đoán khi có đủ 5 phiên lịch sử
+                        if len(history_data) >= 5:
+                            # Thực hiện dự đoán cho phiên tiếp theo
+                            prediction_full = du_doan_theo_xi_ngau(history_data)
+                            prediction_char = 'T' if prediction_full == 'Tài' else 'X'
+
+                            # Áp dụng logic cầu xấu/đẹp từ code 1
+                            reason = "[AI] Phân tích xí ngầu."
+                            if len(current_cau_str) == 5:
+                                if is_cau_xau(current_cau_str):
+                                    print(f"⚠️  Cảnh báo: CẦU XẤU ({current_cau_str})! Đảo ngược kết quả.")
+                                    prediction_char = 'X' if prediction_char == 'T' else 'T'
+                                    reason = f"[AI] Cầu xấu ({current_cau_str}) -> Đảo ngược kết quả."
+                                elif is_cau_dep(current_cau_str):
+                                    print(f"✅ Cầu đẹp ({current_cau_str}) – Giữ nguyên kết quả.")
+                                    reason = f"[AI] Cầu đẹp ({current_cau_str}) -> Giữ nguyên kết quả."
+                                else:
+                                    print(f"ℹ️  Không phát hiện cầu xấu/đẹp rõ ràng ({current_cau_str})")
+                                    reason = f"[AI] Không phát hiện cầu xấu/đẹp rõ ràng ({current_cau_str})."
                             else:
-                                logger.debug(f"Phiên {phien_number} đã được xử lý. Không có phiên mới để thông báo tự động.")
-                                return # Không có phiên mới, thoát khỏi hàm
+                                reason = f"[AI] Cần thêm {5 - len(current_cau_str)} phiên để phân tích cầu."
+                                
+                            final_prediction_text = 'Tài' if prediction_char == 'T' else 'Xỉu'
 
-                        # Nếu là phiên mới (từ tác vụ định kỳ) HOẶC là lệnh /taixiu thủ công, thì cập nhật DB và AI
-                        if is_new_phien or target_chat_id is not None:
-                            database.add_result(phien_number, ket_qua_display, actual_result_char, tong, xuc_xac_1, xuc_xac_2, xuc_xac_3)
-                            # Cập nhật phiên cuối cùng đã xử lý nếu là tác vụ định kỳ
-                            if is_new_phien:
-                                database.update_app_setting('last_processed_phien', str(phien_number))
-                        
-                        # Lấy dữ liệu để dự đoán và hiển thị (luôn làm, dù là phiên mới hay cũ)
-                        history = database.get_latest_history()
-                        ai_scores = database.get_ai_scores()
-                        ai2_consecutive_errors = database.get_ai_state('ai2_defensive')
-
-                        final_prediction_display, ai_individual_predictions = prediction_engine.ensemble_predict(
-                            history, ai_scores, ai2_consecutive_errors
-                        )
-
-                        # Chỉ cập nhật điểm AI nếu đây là phiên MỚI được xử lý (tránh cập nhật nhiều lần)
-                        if is_new_phien:
-                            prediction_engine.update_ai_scores_and_states(
-                                actual_result_char, 
-                                ai_individual_predictions, 
-                                ai_scores, 
-                                ai2_consecutive_errors, 
-                                database.update_ai_score, 
-                                database.update_ai_state  
+                            message_text = (
+                                f"🎮 Kết quả phiên hiện tại: **{current_result_text}**\n"
+                                f"🔢 Phiên: `{current_session}` → `{current_session + 1}`\n"
+                                f"🤖 Dự đoán: **{final_prediction_text}**\n"
+                                f"📌 Lý do: {reason}\n"
+                                f"⚠️ Hãy đặt cược sớm trước khi phiên kết thúc!"
                             )
-                        
-                        # Tạo tin nhắn
-                        message = f"""🎲 <b>Kết quả phiên mới nhất:</b>
-Phiên: <code>{phien_number}</code>
-Kết quả: <b><span style="color:{"#4CAF50" if actual_result_char == "T" else "#FF5722"};">{ket_qua_display}</span></b>
-Tổng: <b>{tong}</b> ({ket_qua_display})
-Xúc xắc: <code>{xuc_xac_1}</code>, <code>{xuc_xac_2}</code>, <code>{xuc_xac_3}</code>
+                            # Gửi dự đoán đến tất cả người dùng có quyền truy cập
+                            for user_id_str, user_info in user_data.items():
+                                user_id = int(user_id_str)
+                                is_sub, sub_message = check_subscription(user_id)
+                                if is_sub:
+                                    try:
+                                        # Xóa tin nhắn dự đoán cũ nếu có
+                                        if user_id in last_prediction_message_id:
+                                            try:
+                                                bot.delete_message(user_id, last_prediction_message_id[user_id])
+                                            except Exception as e:
+                                                print(f"Không thể xóa tin nhắn cũ cho user {user_id}: {e}")
+                                        
+                                        sent_message = bot.send_message(user_id, message_text, parse_mode='Markdown')
+                                        last_prediction_message_id[user_id] = sent_message.message_id
+                                        print(f"Gửi dự đoán cho user {user_id}")
+                                    except Exception as e:
+                                        print(f"Lỗi khi gửi dự đoán cho user {user_id}: {e}")
+                                else:
+                                    print(f"User {user_id} không có quyền truy cập, không gửi dự đoán.")
 
-✨ <b>Dự đoán phiên tiếp theo:</b> <b>{final_prediction_display}</b>
+                        else:
+                            print(f"Chưa đủ 5 phiên lịch sử để dự đoán. Hiện có: {len(history_data)} phiên.")
 
-<pre>
---- Thống kê AI ---
-AI Trend: {ai_scores.get('ai1_trend', 0):.0f} điểm
-AI Defensive: {ai_scores.get('ai2_defensive', 0):.0f} điểm (Lỗi liên tiếp: {ai2_consecutive_errors})
-AI Pattern: {ai_scores.get('ai3_pattern', 0):.0f} điểm
-</pre>
-"""
-                        # Gửi tin nhắn
-                        if target_chat_id: # Gửi cho một chat cụ thể (lệnh /taixiu)
-                            await context.bot.send_message(chat_id=target_chat_id, text=message, parse_mode='HTML')
-                        else: # Gửi cho tất cả người dùng hợp lệ (tác vụ định kỳ)
-                            for uid in list(user_data.keys()): # Lặp qua bản sao của keys để tránh lỗi thay đổi kích thước
-                                try:
-                                    user_info = user_data.get(uid)
-                                    if user_info and datetime.strptime(user_info["expiration_date"], "%Y-%m-%d").date() >= date.today():
-                                        await context.bot.send_message(chat_id=uid, text=message, parse_mode='HTML')
-                                        await asyncio.sleep(0.1) # Tránh bị flood
-                                    # else:
-                                    #     logger.debug(f"Không gửi thông báo tới user {uid} vì đã hết hạn hoặc không có dữ liệu.")
-                                except Exception as e:
-                                    logger.warning(f"Không thể gửi thông báo tự động tới người dùng {uid}: {e}")
-                            logger.info(f"Đã xử lý và thông báo phiên {phien_number} cho tất cả người dùng.")
+            else:
+                print("Không nhận được dữ liệu từ API hoặc dữ liệu trống.")
 
-                    else:
-                        error_message = f"❌ Không thể lấy dữ liệu từ server Tài Xỉu. Vui lòng thử lại sau. (Status: {resp.status})"
-                        logger.warning(error_message)
-                        if target_chat_id: # Chỉ gửi lỗi cho người dùng nếu họ gọi lệnh thủ công
-                            await context.bot.send_message(chat_id=target_chat_id, text=error_message)
-
-        except aiohttp.ClientError as e:
-            error_message = f"❌ Lỗi kết nối đến server Tài Xỉu: {e!s}. Vui lòng kiểm tra kết nối mạng hoặc API."
-            logger.error(error_message, exc_info=True)
-            if target_chat_id:
-                await context.bot.send_message(chat_id=target_chat_id, text=error_message)
-        except json.JSONDecodeError as e:
-            error_message = f"❌ Lỗi đọc dữ liệu từ server: Dữ liệu không phải JSON hợp lệ. Chi tiết: {e!s}"
-            logger.error(error_message, exc_info=True)
-            if target_chat_id:
-                await context.bot.send_message(chat_id=target_chat_id, text=error_message)
         except Exception as e:
-            error_message = f"❌ Lỗi không xác định đã xảy ra: {e!s}. Vui lòng liên hệ hỗ trợ."
-            logger.error(error_message, exc_info=True)
-            if target_chat_id:
-                await context.bot.send_message(chat_id=target_chat_id, text=error_message)
+            print(f"Lỗi trong vòng lặp dự đoán: {e}")
+        
+        time.sleep(5) # Kiểm tra API mỗi 5 giây
 
-# Lệnh Tài Xỉu (người dùng gọi thủ công)
-async def taixiu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await process_and_send_taixiu(context, target_chat_id=user_id)
+# --- Xử lý lệnh Telegram ---
 
-# Hàm gọi bởi JobQueue để kiểm tra phiên mới tự động
-async def check_for_new_phien(context: ContextTypes.DEFAULT_TYPE):
-    # Gọi hàm xử lý chung, không cung cấp target_chat_id để nó gửi cho tất cả người dùng
-    await process_and_send_taixiu(context)
-
-
-# --- Lệnh dành cho Admin/CTV ---
-async def full(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_ctv_or_admin(user_id):
-        await update.message.reply_text("❌ Bạn không có quyền sử dụng lệnh này.")
-        return
-
-    target_user_id = user_id # Mặc định là xem thông tin của chính người dùng
-    if context.args and context.args[0].isdigit():
-        target_user_id = int(context.args[0])
-
-    if target_user_id in user_data:
-        info = user_data[target_user_id]
-        message = (
-            f"Chi tiết người dùng ID: {target_user_id}\n"
-            f"Ngày hết hạn: {info.get('expiration_date', 'N/A')}\n"
-            f"Số xu: {info.get('xu', 0)}\n"
-            f"Là CTV: {'Có' if target_user_id in CTV_IDS else 'Không'}"
-        )
-    else:
-        message = f"Không tìm thấy thông tin cho người dùng ID: {target_user_id}. (Chỉ lưu trong RAM nếu người dùng chưa tương tác)"
-    await update.message.reply_text(message)
-
-
-async def giahan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_ctv_or_admin(user_id):
-        await update.message.reply_text("❌ Bạn không có quyền sử dụng lệnh này.")
-        return
-
-    if len(context.args) != 2 or not context.args[0].isdigit() or not context.args[1].isdigit():
-        await update.message.reply_text(
-            "Sai cú pháp. Sử dụng: /giahan <ID người dùng> <số ngày>"
-        )
-        return
-
-    target_user_id = int(context.args[0])
-    days_to_add = int(context.args[1])
-
-    # Nếu người dùng chưa có trong user_data (RAM), thêm mới với ngày hết hạn từ hôm nay
-    if target_user_id not in user_data:
-        current_exp_date = date.today()
-        user_data[target_user_id] = {"xu": 0} # Mặc định 0 xu
-    else:
-        # Cập nhật ngày hết hạn cho người dùng hiện có
-        current_exp_str = user_data[target_user_id].get("expiration_date", date.today().strftime("%Y-%m-%d"))
-        try:
-            current_exp_date = datetime.strptime(current_exp_str, "%Y-%m-%d").date()
-        except ValueError: # Xử lý trường hợp ngày không hợp lệ, mặc định từ hôm nay
-            current_exp_date = date.today()
-            logger.warning(f"Ngày hết hạn '{current_exp_str}' của user {target_user_id} không hợp lệ, đặt lại từ hôm nay.")
-
-    new_expiration_date = current_exp_date + timedelta(days=days_to_add)
-    user_data[target_user_id]["expiration_date"] = new_expiration_date.strftime("%Y-%m-%d")
-
-    await update.message.reply_text(
-        f"✅ Gia hạn thành công cho người dùng ID {target_user_id} thêm {days_to_add} ngày. "
-        f"Ngày hết hạn mới: {new_expiration_date.strftime('%Y-%m-%d')}"
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    user_id_str = str(message.chat.id)
+    if user_id_str not in user_data:
+        user_data[user_id_str] = {
+            'username': message.from_user.username or message.from_user.first_name,
+            'expiry_date': None,
+            'is_ctv': False # Mặc định không phải CTV
+        }
+        save_user_data(user_data)
+        print(f"Người dùng mới đã thêm: {user_id_str} - {user_data[user_id_str]['username']}")
+    
+    bot.reply_to(message, 
+        f"Chào mừng bạn đến với BOT DỰ ĐOÁN TÀI XỈU SUNWIN!\n"
+        f"Gõ /help để xem danh sách các lệnh hỗ trợ."
     )
-    # Cố gắng thông báo cho người dùng được gia hạn
+
+@bot.message_handler(commands=['help'])
+def show_help(message):
+    help_text = (
+        "🤖 **DANH SÁCH LỆNH HỖ TRỢ** 🤖\n\n"
+        "**Lệnh người dùng:**\n"
+        "🔸 /start: Khởi động bot và thêm bạn vào hệ thống.\n"
+        "🔸 /help: Hiển thị danh sách các lệnh.\n"
+        "🔸 /support: Thông tin hỗ trợ Admin.\n"
+        "🔸 /gia: Xem bảng giá dịch vụ.\n"
+        "🔸 /gopy <nội dung>: Gửi góp ý/báo lỗi cho Admin.\n"
+        "🔸 /nap: Hướng dẫn nạp tiền.\n"
+        "🔸 /dudoan: Bắt đầu nhận dự đoán từ bot.\n\n"
+    )
+    
+    if is_ctv(message.chat.id):
+        help_text += (
+            "**Lệnh Admin/CTV:**\n"
+            "🔹 /full <id>: Xem thông tin người dùng (để trống ID để xem của bạn).\n"
+            "🔹 /giahan <id> <số ngày>: Gia hạn tài khoản người dùng.\n\n"
+        )
+    
+    if is_admin(message.chat.id):
+        help_text += (
+            "**Lệnh Admin Chính:**\n"
+            "👑 /ctv <id>: Thêm người dùng làm CTV.\n"
+            "👑 /xoactv <id>: Xóa người dùng khỏi CTV.\n"
+            "👑 /tb <nội dung>: Gửi thông báo đến tất cả người dùng.\n"
+        )
+    
+    bot.reply_to(message, help_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['support'])
+def show_support(message):
+    bot.reply_to(message, 
+        "Để được hỗ trợ, vui lòng liên hệ Admin:\n"
+        "@heheviptool hoặc @Besttaixiu999"
+    )
+
+@bot.message_handler(commands=['gia'])
+def show_price(message):
+    price_text = (
+        "📊 **BOT SUNWIN XIN THÔNG BÁO BẢNG GIÁ SUN BOT** 📊\n\n"
+        "💸 **20k**: 1 Ngày\n"
+        "💸 **50k**: 1 Tuần\n"
+        "💸 **80k**: 2 Tuần\n"
+        "💸 **130k**: 1 Tháng\n\n"
+        "🤖 BOT SUN TỈ Lệ **85-92%**\n"
+        "⏱️ ĐỌC 24/24\n\n"
+        "Vui Lòng ib @heheviptool hoặc @Besttaixiu999 Để Gia Hạn"
+    )
+    bot.reply_to(message, price_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['gopy'])
+def send_feedback(message):
+    feedback_text = telebot.util.extract_arguments(message.text)
+    if not feedback_text:
+        bot.reply_to(message, "Vui lòng nhập nội dung góp ý. Ví dụ: `/gopy Bot dự đoán rất chuẩn!`")
+        return
+    
+    admin_id = ADMIN_ID # Thay bằng ID admin thật
+    user_name = message.from_user.username or message.from_user.first_name
+    bot.send_message(admin_id, 
+                     f"📢 **GÓP Ý MỚI TỪ NGƯỜI DÙNG** 📢\n\n"
+                     f"**ID:** `{message.chat.id}`\n"
+                     f"**Tên:** @{user_name}\n\n"
+                     f"**Nội dung:**\n`{feedback_text}`",
+                     parse_mode='Markdown')
+    bot.reply_to(message, "Cảm ơn bạn đã gửi góp ý! Admin đã nhận được.")
+
+@bot.message_handler(commands=['nap'])
+def show_deposit_info(message):
+    user_id = message.chat.id
+    deposit_text = (
+        "⚜️ **NẠP TIỀN MUA LƯỢT** ⚜️\n\n"
+        "Để mua lượt, vui lòng chuyển khoản đến:\n"
+        "- Ngân hàng: **MB BANK**\n"
+        "- Số tài khoản: **0939766383**\n"
+        "- Tên chủ TK: **Nguyen Huynh Nhut Quang**\n\n"
+        "**NỘI DUNG CHUYỂN KHOẢN (QUAN TRỌNG):**\n"
+        "`mua luot {user_id}`\n\n"
+        f"❗️ Nội dung bắt buộc của bạn là:\n"
+        f"`mua luot {user_id}`\n\n"
+        "(Vui lòng sao chép đúng nội dung trên để được cộng lượt tự động)\n"
+        "Sau khi chuyển khoản, vui lòng chờ 1-2 phút. Nếu có sự cố, hãy dùng lệnh /support."
+    )
+    bot.reply_to(message, deposit_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['dudoan'])
+def start_prediction(message):
+    user_id = message.chat.id
+    is_sub, sub_message = check_subscription(user_id)
+    
+    if not is_sub:
+        bot.reply_to(message, sub_message + "\nVui lòng liên hệ Admin @heheviptool hoặc @Besttaixiu999 để được hỗ trợ.")
+        return
+    
+    bot.reply_to(message, "✅ Bạn đang có quyền truy cập. Bot sẽ tự động gửi dự đoán các phiên mới nhất tại đây.")
+    # Kích hoạt vòng lặp dự đoán nếu nó chưa chạy
+    # Điều này đã được xử lý bởi luồng riêng, nên chỉ cần thông báo cho user
+    # Vòng lặp dự đoán sẽ tự động gửi tin nhắn đến các user có quyền truy cập.
+
+# --- Lệnh Admin/CTV ---
+@bot.message_handler(commands=['full'])
+def get_user_info(message):
+    if not is_ctv(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+    
+    args = telebot.util.extract_arguments(message.text).split()
+    target_user_id_str = str(message.chat.id) # Mặc định là ID của người gọi lệnh
+    if args and args[0].isdigit():
+        target_user_id_str = args[0]
+    
+    if target_user_id_str not in user_data:
+        bot.reply_to(message, f"Không tìm thấy thông tin cho người dùng ID `{target_user_id_str}`.")
+        return
+
+    user_info = user_data[target_user_id_str]
+    expiry_date_str = user_info.get('expiry_date', 'Không có')
+    username = user_info.get('username', 'Không rõ')
+    is_ctv_status = "Có" if is_ctv(int(target_user_id_str)) else "Không"
+
+    info_text = (
+        f"**THÔNG TIN NGƯỜI DÙNG**\n"
+        f"**ID:** `{target_user_id_str}`\n"
+        f"**Tên:** @{username}\n"
+        f"**Ngày hết hạn:** `{expiry_date_str}`\n"
+        f"**Là CTV/Admin:** {is_ctv_status}"
+    )
+    bot.reply_to(message, info_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['giahan'])
+def extend_subscription(message):
+    if not is_ctv(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
+        return
+    
+    args = telebot.util.extract_arguments(message.text).split()
+    if len(args) != 2 or not args[0].isdigit() or not args[1].isdigit():
+        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/giahan <id_nguoi_dung> <số_ngày>`")
+        return
+    
+    target_user_id_str = args[0]
+    days_to_add = int(args[1])
+    
+    if target_user_id_str not in user_data:
+        # Nếu user chưa có, tạo mới
+        user_data[target_user_id_str] = {
+            'username': "UnknownUser", # Sẽ cập nhật khi user /start lần đầu
+            'expiry_date': None,
+            'is_ctv': False
+        }
+        bot.send_message(message.chat.id, f"Đã tạo tài khoản mới cho user ID `{target_user_id_str}`.")
+
+    # Cập nhật ngày hết hạn
+    current_expiry_str = user_data[target_user_id_str].get('expiry_date')
+    if current_expiry_str:
+        current_expiry_date = datetime.strptime(current_expiry_str, '%Y-%m-%d %H:%M:%S')
+        # Nếu ngày hiện tại đã qua ngày hết hạn, bắt đầu gia hạn từ bây giờ
+        if datetime.now() > current_expiry_date:
+            new_expiry_date = datetime.now() + timedelta(days=days_to_add)
+        else: # Nếu còn hạn, cộng dồn thêm
+            new_expiry_date = current_expiry_date + timedelta(days=days_to_add)
+    else:
+        # Nếu chưa có ngày hết hạn, đặt từ bây giờ
+        new_expiry_date = datetime.now() + timedelta(days=days_to_add)
+    
+    user_data[target_user_id_str]['expiry_date'] = new_expiry_date.strftime('%Y-%m-%d %H:%M:%S')
+    save_user_data(user_data)
+    
+    bot.reply_to(message, 
+                 f"Đã gia hạn thành công cho user ID `{target_user_id_str}` thêm **{days_to_add} ngày**.\n"
+                 f"Ngày hết hạn mới: `{user_data[target_user_id_str]['expiry_date']}`",
+                 parse_mode='Markdown')
+    
+    # Gửi thông báo cho người dùng được gia hạn (nếu có thể)
     try:
-        await context.bot.send_message(chat_id=target_user_id, text=f"🎉 Tài khoản của bạn đã được gia hạn thêm {days_to_add} ngày. Ngày hết hạn mới: {new_expiration_date.strftime('%Y-%m-%d')}")
+        bot.send_message(int(target_user_id_str), 
+                         f"🎉 Tài khoản của bạn đã được gia hạn thêm **{days_to_add} ngày** bởi Admin/CTV!\n"
+                         f"Ngày hết hạn mới của bạn là: `{user_data[target_user_id_str]['expiry_date']}`",
+                         parse_mode='Markdown')
     except Exception as e:
-        logger.warning(f"Không thể gửi thông báo gia hạn tới người dùng {target_user_id}: {e}")
+        print(f"Không thể thông báo gia hạn cho user {target_user_id_str}: {e}")
 
-
-# --- Lệnh dành riêng cho Admin chính ---
-async def ctv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Bạn không phải Admin chính để sử dụng lệnh này.")
+# --- Lệnh Admin Chính ---
+@bot.message_handler(commands=['ctv'])
+def add_ctv(message):
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
-
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        await update.message.reply_text("Sai cú pháp. Sử dụng: /ctv <ID người dùng>")
+    
+    args = telebot.util.extract_arguments(message.text).split()
+    if len(args) != 1 or not args[0].isdigit():
+        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/ctv <id_nguoi_dung>`")
         return
+    
+    target_user_id = int(args[0])
+    if target_user_id not in ctv_list:
+        ctv_list.append(target_user_id)
+        save_ctv_data(ctv_list)
+        bot.reply_to(message, f"Đã thêm user ID `{target_user_id}` làm Cộng Tác Viên.")
+    else:
+        bot.reply_to(message, f"User ID `{target_user_id}` đã là Cộng Tác Viên.")
 
-    target_user_id = int(context.args[0])
-    CTV_IDS.add(target_user_id)
-    await update.message.reply_text(f"✅ Người dùng ID {target_user_id} đã được thêm vào danh sách CTV.")
-
-
-async def xoactv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Bạn không phải Admin chính để sử dụng lệnh này.")
+@bot.message_handler(commands=['xoactv'])
+def remove_ctv(message):
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
-
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        await update.message.reply_text("Sai cú pháp. Sử dụng: /xoactv <ID người dùng>")
+    
+    args = telebot.util.extract_arguments(message.text).split()
+    if len(args) != 1 or not args[0].isdigit():
+        bot.reply_to(message, "Cú pháp sai. Ví dụ: `/xoactv <id_nguoi_dung>`")
         return
+    
+    target_user_id = int(args[0])
+    if target_user_id in ctv_list:
+        ctv_list.remove(target_user_id)
+        save_ctv_data(ctv_list)
+        bot.reply_to(message, f"Đã xóa user ID `{target_user_id}` khỏi danh sách Cộng Tác Viên.")
+    else:
+        bot.reply_to(message, f"User ID `{target_user_id}` không phải là Cộng Tác Viên.")
 
-    target_user_id = int(context.args[0])
-    try:
-        CTV_IDS.remove(target_user_id)
-        await update.message.reply_text(f"✅ Người dùng ID {target_user_id} đã bị xóa khỏi danh sách CTV.")
-    except KeyError:
-        await update.message.reply_text(f"Người dùng ID {target_user_id} không có trong danh sách CTV.")
-
-
-async def tb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Bạn không phải Admin chính để sử dụng lệnh này.")
+@bot.message_handler(commands=['tb'])
+def broadcast_message(message):
+    if not is_admin(message.chat.id):
+        bot.reply_to(message, "Bạn không có quyền sử dụng lệnh này.")
         return
-
-    if not context.args:
-        await update.message.reply_text("Vui lòng nhập nội dung thông báo. Ví dụ: /tb Bot sẽ bảo trì lúc 22h.")
+    
+    broadcast_text = telebot.util.extract_arguments(message.text)
+    if not broadcast_text:
+        bot.reply_to(message, "Vui lòng nhập nội dung thông báo. Ví dụ: `/tb Bot sẽ bảo trì vào lúc 22:00 hôm nay!`")
         return
-
-    broadcast_message = " ".join(context.args)
     
     sent_count = 0
-    failed_count = 0
-    # Lặp qua một bản sao của user_data.keys() để tránh lỗi thay đổi kích thước khi gửi
-    for uid in list(user_data.keys()):
+    fail_count = 0
+    for user_id_str in user_data.keys():
         try:
-            await context.bot.send_message(chat_id=uid, text=f"📢 THÔNG BÁO TỪ ADMIN:\n\n{broadcast_message}")
+            bot.send_message(int(user_id_str), f"📢 **THÔNG BÁO TỪ ADMIN** 📢\n\n{broadcast_text}", parse_mode='Markdown')
             sent_count += 1
-            await asyncio.sleep(0.05) # Tránh bị flood limit của Telegram
+            time.sleep(0.1) # Tránh bị rate limit
         except Exception as e:
-            logger.warning(f"Không thể gửi thông báo tới người dùng {uid}: {e}")
-            failed_count += 1
-    
-    await update.message.reply_text(f"✅ Đã gửi thông báo tới {sent_count} người dùng. Thất bại: {failed_count}.")
+            print(f"Không thể gửi thông báo tới user {user_id_str}: {e}")
+            fail_count += 1
+            
+    bot.reply_to(message, f"Đã gửi thông báo tới **{sent_count} người dùng** thành công. Thất bại: **{fail_count}**.", parse_mode='Markdown')
 
+# --- Keep alive server cho Render ---
+# Sử dụng một hàm riêng biệt và chạy nó trong một luồng khác
+# Đây là nội dung của keep_alive.py, được tích hợp vào file chính
+from flask import Flask
+from threading import Thread
 
-# --- Hàm chính để chạy bot ---
-def main():
-    database.init_db() # Khởi tạo cơ sở dữ liệu khi bot chạy
-    prediction_engine.load_patterns() # Tải các mẫu từ dudoan.txt khi bot chạy
-    
-    # Các kiểm tra TELEGRAM_TOKEN và ADMIN_ID được thực hiện ở đầu file
-    # Nếu có lỗi, chương trình sẽ thoát sớm
+app = Flask('')
 
-    keep_alive() # Gọi hàm này để khởi động server keep-alive (cho Render)
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+@app.route('/')
+def home():
+    return "Bot is running!"
 
-    # Lấy JobQueue từ ứng dụng
-    job_queue = app.job_queue
+def run_flask_server():
+    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
 
-    # Đăng ký tác vụ định kỳ: kiểm tra API mỗi 10 giây (điều chỉnh theo tần suất API cập nhật)
-    job_queue.run_repeating(check_for_new_phien, interval=10, first=0) # first=0 để chạy ngay khi bot khởi động
+# --- Hàm chính để khởi động bot và luồng dự đoán ---
+if __name__ == "__main__":
+    print("Bot đang khởi động...")
 
-    # Đăng ký các lệnh
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("support", support))
-    app.add_handler(CommandHandler("gia", gia))
-    app.add_handler(CommandHandler("gopy", gopy))
-    app.add_handler(CommandHandler("nap", nap))
-    app.add_handler(CommandHandler("taixiu", taixiu))
+    # Khởi chạy server Flask trên một luồng riêng
+    flask_thread = Thread(target=run_flask_server)
+    flask_thread.daemon = True # Đảm bảo luồng này sẽ kết thúc khi chương trình chính kết thúc
+    flask_thread.start()
+    print("Máy chủ Flask Keep Alive đã khởi động.")
 
-    # Lệnh cho Admin/CTV
-    app.add_handler(CommandHandler("full", full))
-    app.add_handler(CommandHandler("giahan", giahan))
+    # Khởi chạy vòng lặp dự đoán trong một luồng riêng
+    prediction_thread = Thread(target=prediction_loop)
+    prediction_thread.daemon = True
+    prediction_thread.start()
+    print("Luồng dự đoán đã khởi động.")
 
-    # Lệnh cho Admin chính
-    app.add_handler(CommandHandler("ctv", ctv))
-    app.add_handler(CommandHandler("xoactv", xoactv))
-    app.add_handler(CommandHandler("tb", tb))
+    # Bắt đầu polling bot Telegram
+    print("Bot Telegram đang lắng nghe tin nhắn...")
+    bot.infinity_polling()
 
-    logger.info("Bot đang chạy... Đang lắng nghe các cập nhật và kiểm tra API tự động.")
-    app.run_polling(poll_interval=1.0) # Lắng nghe update mỗi 1 giây
-
-if __name__ == '__main__':
-    main()
