@@ -9,7 +9,7 @@ import threading
 import re
 
 # --- Cấu hình Bot và API ---
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "7951251597:AAEXH5OtBRxU8irZSd1S4Gh-jicRmSIOK_s")
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "8067678961:AAEqZPi7L2TD4VKGFf4aml0dLf0nEP_P9Jw")
 ADMIN_ID = 6915752059 # ID của bạn
 API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
 USER_DATA_FILE = "user_data.json"
