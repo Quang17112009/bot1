@@ -4,24 +4,38 @@ from datetime import datetime, timedelta
 import json
 import math
 import time
-import requests
+# import requests # Đã bỏ, không còn cần nữa
 import threading
 import re
+import websocket # Import thư viện websocket-client
 
-# --- Cấu hình Bot và API ---
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "8067678961:AAEqZPi7L2TD4VKGFf4aml0dLf0nEP_P9Jw")
-ADMIN_ID = 6915752059 # ID của bạn
-API_URL = "https://apisunwin1.up.railway.app/api/taixiu"
+# --- Cấu hình Bot và WebSocket ---
+# Lấy TOKEN và ADMIN_ID từ biến môi trường của Render
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+ADMIN_ID = int(os.getenv('ADMIN_TELEGRAM_ID')) # Chuyển đổi sang int
+
+WS_URL = "ws://163.61.110.10:8000/game_sunwin/ws?id=duy914c&key=dduy1514nsadfl" # WebSocket URL
 USER_DATA_FILE = "user_data.json"
 CTV_DATA_FILE = "ctv_data.json"
+
+# Kiểm tra nếu TOKEN hoặc ADMIN_ID không được đặt
+if not TOKEN:
+    raise ValueError("Biến môi trường 'TELEGRAM_BOT_TOKEN' chưa được đặt.")
+if not ADMIN_ID:
+    raise ValueError("Biến môi trường 'ADMIN_TELEGRAM_ID' chưa được đặt.")
 
 bot = telebot.TeleBot(TOKEN)
 
 # --- Biến toàn cục để lưu trạng thái bot ---
 last_processed_session = 0 # Phiên cuối cùng bot đã xử lý và đưa ra dự đoán
-history_data = [] # Lưu trữ dữ liệu lịch sử từ API (3 xí ngầu) - [(d1, d2, d3, session_id), ...]
+history_data = [] # Lưu trữ dữ liệu lịch sử từ WS (3 xí ngầu) - [(d1, d2, d3, session_id), ...]
 cau_history = []  # Lưu trữ lịch sử 'T' hoặc 'X' để check cầu - [('T'/'X', session_id), ...]
 last_prediction_message_id = {} # Lưu ID tin nhắn dự đoán để cập nhật/xóa nếu cần
+
+# --- WebSocket related variables ---
+ws_app = None # WebSocket application instance
+ws_connected = False # Flag to track WebSocket connection status
+latest_ws_data = None # Variable to hold the latest data received from WebSocket
 
 # --- Hàm hỗ trợ ---
 def clear_screen():
@@ -130,139 +144,180 @@ def is_cau_dep(cau_str):
     mau_cau_dep_set = set(mau_cau_dep)
     return cau_str in mau_cau_dep_set
 
-# --- Lấy dữ liệu từ API ---
-def get_latest_data_from_api():
+# --- WebSocket Callbacks ---
+def on_message(ws, message):
+    global latest_ws_data
     try:
-        response = requests.get(API_URL)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Lỗi khi lấy dữ liệu từ API: {e}")
-        return None
+        data = json.loads(message)
+        # Assuming the WebSocket sends the latest session data directly
+        if isinstance(data, dict):
+            latest_ws_data = data
+            # print(f"Received data from WebSocket: {latest_ws_data}") # Để debug
+        else:
+            print(f"Received non-dict message from WebSocket: {message}")
+    except json.JSONDecodeError:
+        print(f"Could not decode JSON from WebSocket message: {message}")
+    except Exception as e:
+        print(f"Error processing WebSocket message: {e} - Message: {message}")
+
+def on_error(ws, error):
+    global ws_connected
+    print(f"WebSocket Error: {error}")
+    ws_connected = False # Đánh dấu là đã mất kết nối
+
+def on_close(ws, close_status_code, close_msg):
+    global ws_connected
+    print(f"WebSocket Closed: {close_status_code} - {close_msg}")
+    ws_connected = False # Đánh dấu là đã mất kết nối
+
+def on_open(ws):
+    global ws_connected
+    print("WebSocket Opened.")
+    ws_connected = True # Đánh dấu là đã kết nối
+
+def connect_websocket():
+    global ws_app, ws_connected
+    while True:
+        if not ws_connected or ws_app is None or not ws_app.connected:
+            print("Đang cố gắng kết nối tới WebSocket...")
+            try:
+                ws_app = websocket.WebSocketApp(WS_URL,
+                                                on_open=on_open,
+                                                on_message=on_message,
+                                                on_error=on_error,
+                                                on_close=on_close)
+                # run_forever sẽ chạy cho đến khi kết nối đóng hoặc xảy ra lỗi
+                ws_app.run_forever(ping_interval=30, ping_timeout=10) # Gửi ping để duy trì kết nối
+            except Exception as e:
+                print(f"Kết nối WebSocket thất bại: {e}")
+        time.sleep(5) # Đợi trước khi thử kết nối lại
 
 # --- Logic chính của Bot (Vòng lặp dự đoán) ---
 def prediction_loop():
-    global last_processed_session, history_data, cau_history, last_prediction_message_id
+    global last_processed_session, history_data, cau_history, last_prediction_message_id, latest_ws_data
+
+    # Khởi động kết nối WebSocket trong một luồng riêng biệt
+    websocket_thread = threading.Thread(target=connect_websocket)
+    websocket_thread.daemon = True
+    websocket_thread.start()
+    print("Luồng kết nối WebSocket đã khởi động.")
 
     while True:
-        try:
-            data = get_latest_data_from_api()
-            if data:
-                current_session = data.get("Phien")
-                current_result_text = data.get("Ket_qua")
-                xuc_xac_1 = data.get("Xuc_xac_1")
-                xuc_xac_2 = data.get("Xuc_xac_2")
-                xuc_xac_3 = data.get("Xuc_xac_3")
-                total_dice = data.get("Tong")
+        # Kiểm tra dữ liệu mới từ WebSocket
+        if latest_ws_data:
+            data = latest_ws_data
+            latest_ws_data = None # Tiêu thụ dữ liệu
 
-                current_result_char = 'T' if current_result_text == 'Tài' else 'X'
+            current_session = data.get("Phien")
+            current_result_text = data.get("Ket_qua")
+            xuc_xac_1 = data.get("Xuc_xac_1")
+            xuc_xac_2 = data.get("Xuc_xac_2")
+            xuc_xac_3 = data.get("Xuc_xac_3")
+            total_dice = data.get("Tong")
 
-                # Chỉ xử lý nếu có phiên mới và dữ liệu đầy đủ
-                if current_session and current_session > last_processed_session and \
-                   all(d is not None for d in [xuc_xac_1, xuc_xac_2, xuc_xac_3, current_session, current_result_text, total_dice]):
-                    
-                    print(f"Phát hiện phiên mới từ API: {current_session}")
+            current_result_char = 'T' if current_result_text == 'Tài' else 'X'
 
-                    # Kiểm tra tính liên tục của phiên
-                    if history_data and history_data[-1][3] != current_session - 1:
-                        print(f"Cảnh báo: Mất phiên. Cuối cùng trong lịch sử: {history_data[-1][3]}, phiên hiện tại từ API: {current_session}. Reset lịch sử để tránh sai lệch.")
-                        history_data = []
-                        cau_history = []
-                    elif not history_data and last_processed_session != 0 and current_session != last_processed_session + 1:
-                        # Nếu lịch sử rỗng nhưng bot đã xử lý phiên trước đó,
-                        # và phiên hiện tại không phải là phiên kế tiếp của last_processed_session
-                        print(f"Cảnh báo: Mất phiên khi lịch sử rỗng. Phiên cuối xử lý: {last_processed_session}, phiên hiện tại từ API: {current_session}. Reset last_processed_session.")
-                        last_processed_session = 0 # Reset để bắt đầu thu thập lại
+            # Chỉ xử lý nếu có phiên mới và dữ liệu đầy đủ
+            if current_session and current_session > last_processed_session and \
+               all(d is not None for d in [xuc_xac_1, xuc_xac_2, xuc_xac_3, current_session, current_result_text, total_dice]):
+                
+                print(f"Phát hiện phiên mới từ WebSocket: {current_session}")
 
-                    # Cập nhật lịch sử xí ngầu và cầu
-                    history_data.append((xuc_xac_1, xuc_xac_2, xuc_xac_3, current_session))
-                    if len(history_data) > 5:
-                        history_data.pop(0)
+                # Kiểm tra tính liên tục của phiên
+                if history_data and history_data[-1][3] != current_session - 1:
+                    print(f"Cảnh báo: Mất phiên. Cuối cùng trong lịch sử: {history_data[-1][3]}, phiên hiện tại từ WS: {current_session}. Reset lịch sử để tránh sai lệch.")
+                    history_data = []
+                    cau_history = []
+                elif not history_data and last_processed_session != 0 and current_session != last_processed_session + 1:
+                    # Nếu lịch sử rỗng nhưng bot đã xử lý phiên trước đó,
+                    # và phiên hiện tại không phải là phiên kế tiếp của last_processed_session
+                    print(f"Cảnh báo: Mất phiên khi lịch sử rỗng. Phiên cuối xử lý: {last_processed_session}, phiên hiện tại từ WS: {current_session}. Reset last_processed_session.")
+                    last_processed_session = 0 # Reset để bắt đầu thu thập lại
 
-                    cau_history.append((current_result_char, current_session))
-                    if len(cau_history) > 5:
-                        cau_history.pop(0)
-                    
-                    last_processed_session = current_session # Cập nhật phiên đã xử lý
+                # Cập nhật lịch sử xí ngầu và cầu
+                history_data.append((xuc_xac_1, xuc_xac_2, xuc_xac_3, current_session))
+                if len(history_data) > 5:
+                    history_data.pop(0)
 
-                    current_cau_str = "".join([item[0] for item in cau_history])
-                    
-                    print(f"Lịch sử xí ngầu ({len(history_data)}): {history_data}")
-                    print(f"Lịch sử cầu ({len(cau_history)}): {current_cau_str}")
-                    print(f"Kết quả phiên {current_session}: {current_result_text} (Tổng: {total_dice} - Xí ngầu: {xuc_xac_1}, {xuc_xac_2}, {xuc_xac_3})")
+                cau_history.append((current_result_char, current_session))
+                if len(cau_history) > 5:
+                    cau_history.pop(0)
+                
+                last_processed_session = current_session # Cập nhật phiên đã xử lý
 
-                    # Chỉ dự đoán khi có đủ 5 phiên lịch sử
-                    if len(history_data) >= 5 and len(cau_history) >= 5:
-                        prediction_full = du_doan_theo_xi_ngau(history_data)
-                        prediction_char = 'T' if prediction_full == 'Tài' else 'X'
+                current_cau_str = "".join([item[0] for item in cau_history])
+                
+                print(f"Lịch sử xí ngầu ({len(history_data)}): {history_data}")
+                print(f"Lịch sử cầu ({len(cau_history)}): {current_cau_str}")
+                print(f"Kết quả phiên {current_session}: {current_result_text} (Tổng: {total_dice} - Xí ngầu: {xuc_xac_1}, {xuc_xac_2}, {xuc_xac_3})")
 
-                        reason = "[AI] Phân tích xí ngầu."
-                        if len(current_cau_str) == 5:
-                            if is_cau_xau(current_cau_str):
-                                print(f"⚠️  Cảnh báo: CẦU XẤU ({current_cau_str})! Đảo ngược kết quả.")
-                                prediction_char = 'X' if prediction_char == 'T' else 'T'
-                                reason = f"[AI] Cầu xấu ({current_cau_str}) -> Đảo ngược kết quả."
-                            elif is_cau_dep(current_cau_str):
-                                print(f"✅ Cầu đẹp ({current_cau_str}) – Giữ nguyên kết quả.")
-                                reason = f"[AI] Cầu đẹp ({current_cau_str}) -> Giữ nguyên kết quả."
-                            else:
-                                print(f"ℹ️  Không phát hiện cầu xấu/đẹp rõ ràng ({current_cau_str})")
-                                reason = f"[AI] Không phát hiện cầu xấu/đẹp rõ ràng ({current_cau_str})."
-                        else: # Trường hợp này không nên xảy ra nếu len(cau_history) >= 5
-                            reason = f"[AI] Cần thêm {5 - len(current_cau_str)} phiên để phân tích cầu."
-                            
-                        final_prediction_text = 'Tài' if prediction_char == 'T' else 'Xỉu'
+                # Chỉ dự đoán khi có đủ 5 phiên lịch sử
+                if len(history_data) >= 5 and len(cau_history) >= 5:
+                    prediction_full = du_doan_theo_xi_ngau(history_data)
+                    prediction_char = 'T' if prediction_full == 'Tài' else 'X'
 
-                        message_text = (
-                            f"🎮 Kết quả phiên hiện tại: **{current_result_text}** (Tổng: {total_dice})\n"
-                            f"🔢 Phiên: `{current_session}` → `{current_session + 1}`\n"
-                            f"🤖 Dự đoán: **{final_prediction_text}**\n"
-                            f"📌 Lý do: {reason}\n"
-                            f"⚠️ Hãy đặt cược sớm trước khi phiên kết thúc!"
-                        )
+                    reason = "[AI] Phân tích xí ngầu."
+                    if len(current_cau_str) == 5:
+                        if is_cau_xau(current_cau_str):
+                            print(f"⚠️  Cảnh báo: CẦU XẤU ({current_cau_str})! Đảo ngược kết quả.")
+                            prediction_char = 'X' if prediction_char == 'T' else 'T'
+                            reason = f"[AI] Cầu xấu ({current_cau_str}) -> Đảo ngược kết quả."
+                        elif is_cau_dep(current_cau_str):
+                            print(f"✅ Cầu đẹp ({current_cau_str}) – Giữ nguyên kết quả.")
+                            reason = f"[AI] Cầu đẹp ({current_cau_str}) -> Giữ nguyên kết quả."
+                        else:
+                            print(f"ℹ️  Không phát hiện cầu xấu/đẹp rõ ràng ({current_cau_str})")
+                            reason = f"[AI] Không phát hiện cầu xấu/đẹp rõ ràng ({current_cau_str})."
+                    else: # Trường hợp này không nên xảy ra nếu len(cau_history) >= 5
+                        reason = f"[AI] Cần thêm {5 - len(current_cau_str)} phiên để phân tích cầu."
                         
-                        # Gửi dự đoán đến tất cả người dùng có quyền truy cập
-                        for user_id_str, user_info in user_data.items():
-                            user_id = int(user_id_str)
-                            is_sub, sub_message = check_subscription(user_id)
-                            if is_sub:
-                                try:
-                                    # Xóa tin nhắn dự đoán cũ nếu có
-                                    if user_id in last_prediction_message_id:
-                                        try:
-                                            bot.delete_message(user_id, last_prediction_message_id[user_id])
-                                        except telebot.apihelper.ApiTelegramException as e:
-                                            # Bỏ qua lỗi nếu tin nhắn không tìm thấy để xóa (ví dụ: đã quá cũ)
-                                            if "message to delete not found" not in str(e).lower():
-                                                print(f"Lỗi khi xóa tin nhắn cũ cho user {user_id}: {e}")
-                                        except Exception as e:
-                                            print(f"Lỗi không xác định khi xóa tin nhắn cũ cho user {user_id}: {e}")
-                                    
-                                    sent_message = bot.send_message(user_id, message_text, parse_mode='Markdown')
-                                    last_prediction_message_id[user_id] = sent_message.message_id
-                                    print(f"Gửi dự đoán cho user {user_id}")
-                                except telebot.apihelper.ApiTelegramException as e:
-                                    # Xử lý lỗi khi bot không thể gửi tin nhắn (ví dụ: người dùng đã chặn bot)
-                                    if "bot was blocked by the user" in str(e).lower():
-                                        print(f"Người dùng {user_id} đã chặn bot. Không gửi tin nhắn.")
-                                    else:
-                                        print(f"Lỗi API Telegram khi gửi dự đoán cho user {user_id}: {e}")
-                                except Exception as e:
-                                    print(f"Lỗi không xác định khi gửi dự đoán cho user {user_id}: {e}")
-                            # else: # Không in dòng này để log không quá dài, chỉ in khi debug
-                            #     print(f"User {user_id} không có quyền truy cập, không gửi dự đoán.")
+                    final_prediction_text = 'Tài' if prediction_char == 'T' else 'Xỉu'
 
-                    else:
-                        print(f"Chưa đủ 5 phiên lịch sử để dự đoán. Hiện có: {len(history_data)} phiên xí ngầu, {len(cau_history)} phiên cầu.")
-                # else: # Không in dòng này để log không quá dài
-                #     print(f"Không có phiên mới hoặc dữ liệu không đầy đủ. Phiên hiện tại: {current_session}, Phiên cuối xử lý: {last_processed_session}")
-            else:
-                print("Không nhận được dữ liệu từ API hoặc dữ liệu trống.")
+                    message_text = (
+                        f"🎮 Kết quả phiên hiện tại: **{current_result_text}** (Tổng: {total_dice})\n"
+                        f"🔢 Phiên: `{current_session}` → `{current_session + 1}`\n"
+                        f"🤖 Dự đoán: **{final_prediction_text}**\n"
+                        f"📌 Lý do: {reason}\n"
+                        f"⚠️ Hãy đặt cược sớm trước khi phiên kết thúc!"
+                    )
+                    
+                    # Gửi dự đoán đến tất cả người dùng có quyền truy cập
+                    for user_id_str, user_info in user_data.items():
+                        user_id = int(user_id_str)
+                        is_sub, sub_message = check_subscription(user_id)
+                        if is_sub:
+                            try:
+                                # Xóa tin nhắn dự đoán cũ nếu có
+                                if user_id in last_prediction_message_id:
+                                    try:
+                                        bot.delete_message(user_id, last_prediction_message_id[user_id])
+                                    except telebot.apihelper.ApiTelegramException as e:
+                                        # Bỏ qua lỗi nếu tin nhắn không tìm thấy để xóa (ví dụ: đã quá cũ)
+                                        if "message to delete not found" not in str(e).lower():
+                                            print(f"Lỗi khi xóa tin nhắn cũ cho user {user_id}: {e}")
+                                    except Exception as e:
+                                        print(f"Lỗi không xác định khi xóa tin nhắn cũ cho user {user_id}: {e}")
+                                
+                                sent_message = bot.send_message(user_id, message_text, parse_mode='Markdown')
+                                last_prediction_message_id[user_id] = sent_message.message_id
+                                print(f"Gửi dự đoán cho user {user_id}")
+                            except telebot.apihelper.ApiTelegramException as e:
+                                # Xử lý lỗi khi bot không thể gửi tin nhắn (ví dụ: người dùng đã chặn bot)
+                                if "bot was blocked by the user" in str(e).lower():
+                                    print(f"Người dùng {user_id} đã chặn bot. Không gửi tin nhắn.")
+                                else:
+                                    print(f"Lỗi API Telegram khi gửi dự đoán cho user {user_id}: {e}")
+                            except Exception as e:
+                                print(f"Lỗi không xác định khi gửi dự đoán cho user {user_id}: {e}")
+                else:
+                    print(f"Chưa đủ 5 phiên lịch sử để dự đoán. Hiện có: {len(history_data)} phiên xí ngầu, {len(cau_history)} phiên cầu.")
+        else:
+            # Nếu không có dữ liệu mới từ WebSocket, đợi một chút trước khi kiểm tra lại
+            time.sleep(0.1) # Độ trễ nhỏ để tránh sử dụng CPU quá mức nếu không có dữ liệu mới
 
-        except Exception as e:
-            print(f"Lỗi trong vòng lặp dự đoán (prediction_loop): {e}")
-        
-        time.sleep(5) # Kiểm tra API mỗi 5 giây
+        # Thêm một độ trễ nhỏ vào vòng lặp dự đoán để không chiếm dụng CPU không cần thiết
+        time.sleep(0.5) 
+
 
 # --- Xử lý lệnh Telegram ---
 
